@@ -5,5 +5,5 @@ numpy==2.2.1
 opencv-contrib-python==5.0.0.93
 ultralytics==8.4.172
 mediapipe==1.0.1
-torch==2.14.1
-torchvision==0.29.1
+torch==2.8.0
+torchvision==0.23.0
