@@ -18,3 +18,12 @@ env/
 *.pt
 *.onnx
 *.weights
+
+.venv/
+__pycache__/
+*.pyc
+.cache/
+.cache/
+.env
+.gradio/
+*.log
