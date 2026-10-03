@@ -7,7 +7,15 @@ from dataclasses import dataclass, field
 from collections import deque
 
 import av
-import cv2
+import traceback
+import streamlit as st
+
+try:
+    import cv2
+except Exception as e:
+    st.error("OpenCV import failed")
+    st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)))
+    st.stop()
 import numpy as np
 import streamlit as st
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
