@@ -7,15 +7,7 @@ from dataclasses import dataclass, field
 from collections import deque
 
 import av
-import traceback
-import streamlit as st
-
-try:
-    import cv2
-except Exception as e:
-    st.error("OpenCV import failed")
-    st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)))
-    st.stop()
+import cv2
 import numpy as np
 import streamlit as st
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
@@ -34,7 +26,7 @@ st.set_page_config(
 )
 
 
-APP_VERSION = "11.0"
+APP_VERSION = "12.0"
 
 OBJECT_MODEL = "yolo11n.pt"
 POSE_MODEL = "yolo11n-pose.pt"
@@ -168,6 +160,23 @@ HAND_CONNECTIONS = [
 ]
 
 
+RTC_CONFIGURATION = RTCConfiguration(
+    {
+        "iceServers": [
+            {
+                "urls": [
+                    "stun:stun.l.google.com:19302",
+                    "stun:stun1.l.google.com:19302",
+                    "stun:stun2.l.google.com:19302",
+                    "stun:stun3.l.google.com:19302",
+                    "stun:stun4.l.google.com:19302"
+                ]
+            }
+        ]
+    }
+)
+
+
 def iou(a, b):
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
@@ -211,6 +220,7 @@ def group_for(label):
     for group, labels in OBJECT_GROUPS.items():
         if label in labels:
             return group
+
     return "Other"
 
 
@@ -223,7 +233,9 @@ def download_hand_model():
             HAND_MODEL_URL,
             HAND_MODEL_PATH
         )
+
         return HAND_MODEL_PATH
+
     except Exception:
         return None
 
@@ -288,7 +300,6 @@ class Config:
     object_confidence: float = 0.35
     pose_confidence: float = 0.35
     hand_confidence: float = 0.35
-    inference_size: int = 320
     mirror: bool = True
     show_hud: bool = True
     show_fps: bool = True
@@ -321,6 +332,7 @@ class SharedState:
         with self.lock:
             if self.frame is None:
                 return None, self.frame_id
+
             return self.frame, self.frame_id
 
     def set_snapshot(self, snapshot):
@@ -353,6 +365,7 @@ class EMA:
                 self.alpha * value
                 + (1 - self.alpha) * self.value
             )
+
         return self.value
 
 
@@ -395,6 +408,7 @@ class Tracker:
             current[best_id] = item.box
 
         self.previous = current
+
         return items
 
 
@@ -452,6 +466,7 @@ class Motion:
         if person_id not in self.previous:
             self.previous[person_id] = current
             self.filters[person_id] = EMA(0.3)
+
             return 0.0, "Still"
 
         movement = distance(
@@ -476,46 +491,6 @@ class Motion:
 
 
 class Kinematics:
-    @staticmethod
-    def angle(a, b, c):
-        if not a or not b or not c:
-            return 0
-
-        ba = np.array([
-            a[0] - b[0],
-            a[1] - b[1]
-        ])
-
-        bc = np.array([
-            c[0] - b[0],
-            c[1] - b[1]
-        ])
-
-        denominator = (
-            np.linalg.norm(ba)
-            * np.linalg.norm(bc)
-        )
-
-        if denominator == 0:
-            return 0
-
-        value = (
-            np.dot(ba, bc)
-            / denominator
-        )
-
-        value = np.clip(
-            value,
-            -1,
-            1
-        )
-
-        return float(
-            np.degrees(
-                np.arccos(value)
-            )
-        )
-
     @staticmethod
     def posture(points):
         if len(points) < 17:
@@ -640,27 +615,41 @@ class GestureRecognizer:
         thumb = self.thumb(points)
 
         index = self.extended(
-            points, 8, 6, 5
+            points,
+            8,
+            6,
+            5
         )
 
         middle = self.extended(
-            points, 12, 10, 9
+            points,
+            12,
+            10,
+            9
         )
 
         ring = self.extended(
-            points, 16, 14, 13
+            points,
+            16,
+            14,
+            13
         )
 
         pinky = self.extended(
-            points, 20, 18, 17
+            points,
+            20,
+            18,
+            17
         )
 
-        total = sum([
-            index,
-            middle,
-            ring,
-            pinky
-        ])
+        total = sum(
+            [
+                index,
+                middle,
+                ring,
+                pinky
+            ]
+        )
 
         if (
             middle
@@ -777,23 +766,13 @@ class HandLandmarker:
                 model_asset_path=path
             )
 
-            options = (
-                vision.HandLandmarkerOptions(
-                    base_options=base,
-                    running_mode=(
-                        vision.RunningMode.IMAGE
-                    ),
-                    num_hands=4,
-                    min_hand_detection_confidence=(
-                        confidence
-                    ),
-                    min_hand_presence_confidence=(
-                        confidence
-                    ),
-                    min_tracking_confidence=(
-                        confidence
-                    )
-                )
+            options = vision.HandLandmarkerOptions(
+                base_options=base,
+                running_mode=vision.RunningMode.IMAGE,
+                num_hands=4,
+                min_hand_detection_confidence=confidence,
+                min_hand_presence_confidence=confidence,
+                min_tracking_confidence=confidence
             )
 
             self.landmarker = (
@@ -812,24 +791,21 @@ class HandLandmarker:
         if not self.available:
             return []
 
-        rgb = cv2.cvtColor(
-            frame,
-            cv2.COLOR_BGR2RGB
-        )
-
-        image = mp.Image(
-            image_format=(
-                mp.ImageFormat.SRGB
-            ),
-            data=rgb
-        )
-
         try:
-            result = (
-                self.landmarker.detect(
-                    image
-                )
+            rgb = cv2.cvtColor(
+                frame,
+                cv2.COLOR_BGR2RGB
             )
+
+            image = mp.Image(
+                image_format=mp.ImageFormat.SRGB,
+                data=rgb
+            )
+
+            result = self.landmarker.detect(
+                image
+            )
+
         except Exception:
             return []
 
@@ -844,7 +820,6 @@ class HandLandmarker:
             result.hand_landmarks
         ):
             points = []
-
             xs = []
             ys = []
 
@@ -863,7 +838,7 @@ class HandLandmarker:
                 continue
 
             handedness = "Unknown"
-            confidence = 0
+            confidence = 0.0
 
             if (
                 result.handedness
@@ -905,14 +880,10 @@ class HandLandmarker:
 
             output.append(
                 {
-                    "handedness":
-                        handedness,
-                    "confidence":
-                        confidence,
-                    "box":
-                        box,
-                    "landmarks":
-                        points
+                    "handedness": handedness,
+                    "confidence": confidence,
+                    "box": box,
+                    "landmarks": points
                 }
             )
 
@@ -991,10 +962,8 @@ class LifeVisionProcessor:
                 POSE_MODEL
             )
 
-            self.hand_model = (
-                HandLandmarker(
-                    self.config.hand_confidence
-                )
+            self.hand_model = HandLandmarker(
+                self.config.hand_confidence
             )
 
     def inference_size(self):
@@ -1054,9 +1023,7 @@ class LifeVisionProcessor:
             started = time.perf_counter()
 
             try:
-                self.process(
-                    frame
-                )
+                self.process(frame)
             except Exception:
                 pass
 
@@ -1073,10 +1040,8 @@ class LifeVisionProcessor:
             )
 
     def process(self, frame):
-        ai_frame = (
-            self.resize_for_ai(
-                frame
-            )
+        ai_frame = self.resize_for_ai(
+            frame
         )
 
         h, w = ai_frame.shape[:2]
@@ -1117,27 +1082,21 @@ class LifeVisionProcessor:
 
         scene = self.get_scene()
 
-        narrative = (
-            self.get_narrative(
-                scene
-            )
-        )
-
-        self.generate_events(
+        narrative = self.get_narrative(
             scene
         )
+
+        self.generate_events(scene)
 
         snapshot = Snapshot(
             timestamp=time.time(),
             scene=scene,
             narrative=narrative,
             camera_fps=(
-                self.camera_fps.value
-                or 0
+                self.camera_fps.value or 0
             ),
             ai_fps=(
-                self.ai_fps.value
-                or 0
+                self.ai_fps.value or 0
             ),
             latency=(
                 1000 /
@@ -1146,26 +1105,18 @@ class LifeVisionProcessor:
                     0.1
                 )
             ),
-            objects=list(
-                self.objects
-            ),
-            people=list(
-                self.people
-            ),
-            hands=list(
-                self.hands
-            )
+            objects=list(self.objects),
+            people=list(self.people),
+            hands=list(self.hands)
         )
 
         self.shared.set_snapshot(
             snapshot
         )
 
-        self.latest_output = (
-            self.draw(
-                frame,
-                scene
-            )
+        self.latest_output = self.draw(
+            frame,
+            scene
         )
 
     def process_object_mode(
@@ -1180,12 +1131,10 @@ class LifeVisionProcessor:
             and now - self.last_object_run
             >= self.object_interval
         ):
-            self.objects = (
-                self.detect_objects(
-                    frame,
-                    sx,
-                    sy
-                )
+            self.objects = self.detect_objects(
+                frame,
+                sx,
+                sy
             )
 
             self.last_object_run = now
@@ -1218,12 +1167,10 @@ class LifeVisionProcessor:
             and now - self.last_pose_run
             >= self.pose_interval
         ):
-            self.people = (
-                self.detect_pose(
-                    frame,
-                    sx,
-                    sy
-                )
+            self.people = self.detect_pose(
+                frame,
+                sx,
+                sy
             )
 
             self.last_pose_run = now
@@ -1234,12 +1181,10 @@ class LifeVisionProcessor:
             and now - self.last_hand_run
             >= self.hand_interval
         ):
-            self.hands = (
-                self.detect_hands(
-                    frame,
-                    sx,
-                    sy
-                )
+            self.hands = self.detect_hands(
+                frame,
+                sx,
+                sy
             )
 
             self.last_hand_run = now
@@ -1258,12 +1203,10 @@ class LifeVisionProcessor:
             and now - self.last_object_run
             >= self.object_interval
         ):
-            self.objects = (
-                self.detect_objects(
-                    frame,
-                    sx,
-                    sy
-                )
+            self.objects = self.detect_objects(
+                frame,
+                sx,
+                sy
             )
 
             self.last_object_run = now
@@ -1277,12 +1220,10 @@ class LifeVisionProcessor:
             and now - self.last_pose_run
             >= self.pose_interval
         ):
-            self.people = (
-                self.detect_pose(
-                    frame,
-                    sx,
-                    sy
-                )
+            self.people = self.detect_pose(
+                frame,
+                sx,
+                sy
             )
 
             self.last_pose_run = now
@@ -1293,12 +1234,10 @@ class LifeVisionProcessor:
             and now - self.last_hand_run
             >= self.hand_interval
         ):
-            self.hands = (
-                self.detect_hands(
-                    frame,
-                    sx,
-                    sy
-                )
+            self.hands = self.detect_hands(
+                frame,
+                sx,
+                sy
             )
 
             self.last_hand_run = now
@@ -1312,17 +1251,16 @@ class LifeVisionProcessor:
         sy
     ):
         try:
-            results = (
-                self.object_model.predict(
-                    frame,
-                    imgsz=self.inference_size(),
-                    conf=self.config.object_confidence,
-                    iou=0.5,
-                    max_det=30,
-                    verbose=False,
-                    device="cpu"
-                )
+            results = self.object_model.predict(
+                frame,
+                imgsz=self.inference_size(),
+                conf=self.config.object_confidence,
+                iou=0.5,
+                max_det=30,
+                verbose=False,
+                device="cpu"
             )
+
         except Exception:
             return self.objects
 
@@ -1350,14 +1288,9 @@ class LifeVisionProcessor:
                 str(class_id)
             )
 
-            group = group_for(
-                label
-            )
+            group = group_for(label)
 
-            if (
-                group
-                not in self.config.groups
-            ):
+            if group not in self.config.groups:
                 continue
 
             x1, y1, x2, y2 = (
@@ -1389,17 +1322,16 @@ class LifeVisionProcessor:
         sy
     ):
         try:
-            results = (
-                self.pose_model.predict(
-                    frame,
-                    imgsz=self.inference_size(),
-                    conf=self.config.pose_confidence,
-                    iou=0.5,
-                    max_det=8,
-                    verbose=False,
-                    device="cpu"
-                )
+            results = self.pose_model.predict(
+                frame,
+                imgsz=self.inference_size(),
+                conf=self.config.pose_confidence,
+                iou=0.5,
+                max_det=8,
+                verbose=False,
+                device="cpu"
             )
+
         except Exception:
             return self.people
 
@@ -1471,22 +1403,16 @@ class LifeVisionProcessor:
                 )
             )
 
-            people.append(
-                person
-            )
+            people.append(person)
 
-        people = (
-            self.person_tracker.update(
-                people
-            )
+        people = self.person_tracker.update(
+            people
         )
 
         for person in people:
-            speed, movement = (
-                self.motion.update(
-                    person.person_id,
-                    person.box
-                )
+            speed, movement = self.motion.update(
+                person.person_id,
+                person.box
             )
 
             person.velocity = speed
@@ -1500,18 +1426,14 @@ class LifeVisionProcessor:
         sx,
         sy
     ):
-        hands = (
-            self.hand_model.detect(
-                frame
-            )
+        hands = self.hand_model.detect(
+            frame
         )
 
         output = []
 
         for hand in hands:
-            x1, y1, x2, y2 = (
-                hand["box"]
-            )
+            x1, y1, x2, y2 = hand["box"]
 
             landmarks = []
 
@@ -1525,22 +1447,16 @@ class LifeVisionProcessor:
 
             output.append(
                 HandState(
-                    handedness=(
-                        hand["handedness"]
-                    ),
-                    confidence=(
-                        hand["confidence"]
-                    ),
+                    handedness=hand["handedness"],
+                    confidence=hand["confidence"],
                     box=(
                         int(x1 * sx),
                         int(y1 * sy),
                         int(x2 * sx),
                         int(y2 * sy)
                     ),
-                    gesture=(
-                        self.gesture.recognize(
-                            landmarks
-                        )
+                    gesture=self.gesture.recognize(
+                        landmarks
                     ),
                     landmarks=landmarks
                 )
@@ -1554,19 +1470,13 @@ class LifeVisionProcessor:
             person.gestures = []
 
         for hand in self.hands:
-            hx, hy = center(
-                hand.box
-            )
+            hx, hy = center(hand.box)
 
             closest = None
-            closest_distance = float(
-                "inf"
-            )
+            closest_distance = float("inf")
 
             for person in self.people:
-                x1, y1, x2, y2 = (
-                    person.box
-                )
+                x1, y1, x2, y2 = person.box
 
                 if (
                     x1 - 80 <= hx <= x2 + 80
@@ -1583,17 +1493,12 @@ class LifeVisionProcessor:
                         closest = person
 
             if closest:
-                hand.person_id = (
-                    closest.person_id
-                )
+                hand.person_id = closest.person_id
 
-                closest.hands.append(
-                    hand
-                )
+                closest.hands.append(hand)
 
                 if (
-                    hand.gesture
-                    != "Unknown"
+                    hand.gesture != "Unknown"
                     and
                     hand.gesture
                     not in closest.gestures
@@ -1603,9 +1508,7 @@ class LifeVisionProcessor:
                     )
 
     def get_scene(self):
-        people = len(
-            self.people
-        )
+        people = len(self.people)
 
         animals = sum(
             1
@@ -1799,15 +1702,13 @@ class LifeVisionProcessor:
     def draw(self, frame, scene):
         output = frame.copy()
 
+        height, width = output.shape[:2]
+
         if self.config.mirror:
             output = cv2.flip(
                 output,
                 1
             )
-
-        height, width = (
-            output.shape[:2]
-        )
 
         if (
             self.config.mode
@@ -1849,9 +1750,7 @@ class LifeVisionProcessor:
                 )
 
         for person in self.people:
-            x1, y1, x2, y2 = (
-                person.box
-            )
+            x1, y1, x2, y2 = person.box
 
             if self.config.mirror:
                 x1, x2 = (
@@ -1994,9 +1893,7 @@ class LifeVisionProcessor:
 
         for point in points:
             if point is None:
-                transformed.append(
-                    None
-                )
+                transformed.append(None)
                 continue
 
             x, y = point
@@ -2083,9 +1980,7 @@ class LifeVisionProcessor:
                 cv2.LINE_AA
             )
 
-        x1, y1, x2, y2 = (
-            hand.box
-        )
+        x1, y1, x2, y2 = hand.box
 
         if self.config.mirror:
             x1, x2 = (
@@ -2137,24 +2032,12 @@ class LifeVisionProcessor:
                 1 / delta
             )
 
-        camera_frame = image
+        self.shared.set_frame(image)
 
-        if self.config.mirror:
-            camera_frame = cv2.flip(
-                camera_frame,
-                1
-            )
-
-        self.shared.set_frame(
-            camera_frame
-        )
-
-        output = (
-            self.latest_output
-        )
+        output = self.latest_output
 
         if output is None:
-            output = camera_frame
+            output = image
 
         return av.VideoFrame.from_ndarray(
             output,
@@ -2175,14 +2058,11 @@ class LifeVisionProcessor:
 
 
 if "lv_shared" not in st.session_state:
-    st.session_state.lv_shared = (
-        SharedState()
-    )
+    st.session_state.lv_shared = SharedState()
+
 
 if "lv_config" not in st.session_state:
-    st.session_state.lv_config = (
-        Config()
-    )
+    st.session_state.lv_config = Config()
 
 
 shared = st.session_state.lv_shared
@@ -2192,18 +2072,16 @@ config = st.session_state.lv_config
 with st.sidebar:
     st.title("👁️ LifeVision")
 
+    modes = [
+        "Object & People Awareness",
+        "Gesture & Body Awareness",
+        "Live Scene"
+    ]
+
     new_mode = st.radio(
         "Vision Mode",
-        [
-            "Object & People Awareness",
-            "Gesture & Body Awareness",
-            "Live Scene"
-        ],
-        index=[
-            "Object & People Awareness",
-            "Gesture & Body Awareness",
-            "Live Scene"
-        ].index(config.mode)
+        modes,
+        index=modes.index(config.mode)
     )
 
     config.mode = new_mode
@@ -2318,9 +2196,7 @@ with st.sidebar:
     ]:
         config.groups = st.multiselect(
             "Object categories",
-            list(
-                OBJECT_GROUPS.keys()
-            ),
+            list(OBJECT_GROUPS.keys()),
             default=config.groups
         )
 
@@ -2336,16 +2212,12 @@ processor_key = (
 
 
 if (
-    "lv_processor_key"
-    not in st.session_state
+    "lv_processor_key" not in st.session_state
     or
-    st.session_state.lv_processor_key
-    != processor_key
+    st.session_state.lv_processor_key != processor_key
 ):
-    old_processor = (
-        st.session_state.get(
-            "lv_processor"
-        )
+    old_processor = st.session_state.get(
+        "lv_processor"
     )
 
     if old_processor:
@@ -2363,8 +2235,12 @@ if (
     )
 
 
-processor = (
-    st.session_state.lv_processor
+processor = st.session_state.lv_processor
+
+
+camera_key = (
+    "lifevision-camera-v12-"
+    f"{int(config.mirror)}"
 )
 
 
@@ -2372,20 +2248,14 @@ def processor_factory():
     return processor
 
 
-webrtc_streamer(
-    key="lifevision-camera-v11",
+st.markdown(
+    "### LifeVision Camera"
+)
+
+webrtc_ctx = webrtc_streamer(
+    key=camera_key,
     mode=WebRtcMode.SENDRECV,
-    rtc_configuration=RTCConfiguration(
-        {
-            "iceServers": [
-                {
-                    "urls": [
-                        "stun:stun.l.google.com:19302"
-                    ]
-                }
-            ]
-        }
-    ),
+    rtc_configuration=RTC_CONFIGURATION,
     media_stream_constraints={
         "video": {
             "width": {
@@ -2395,7 +2265,7 @@ webrtc_streamer(
                 "ideal": 720
             },
             "frameRate": {
-                "ideal": 30,
+                "ideal": 24,
                 "max": 30
             }
         },
@@ -2406,14 +2276,23 @@ webrtc_streamer(
 )
 
 
+if webrtc_ctx.state.playing:
+    st.caption(
+        "Camera connected. LifeVision is processing the latest available frame."
+    )
+else:
+    st.info(
+        "Press START to connect the camera. "
+        "If the browser asks for permission, allow camera access."
+    )
+
+
 st.divider()
 
 
 @st.fragment(run_every=0.7)
 def information_panel():
-    snapshot = (
-        shared.get_snapshot()
-    )
+    snapshot = shared.get_snapshot()
 
     st.subheader(
         "Live Information"
@@ -2567,9 +2446,7 @@ def information_panel():
         "### Event Log"
     )
 
-    events = (
-        shared.get_events()
-    )
+    events = shared.get_events()
 
     if events:
         for event in events[:15]:
@@ -2595,6 +2472,7 @@ information_panel()
 
 
 st.divider()
+
 
 st.caption(
     f"LifeVision {APP_VERSION} · "
