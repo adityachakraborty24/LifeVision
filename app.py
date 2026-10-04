@@ -33,7 +33,7 @@ except Exception:
     MEDIAPIPE_AVAILABLE = False
 
 
-APP_VERSION = "18.0"
+APP_VERSION = "19.0"
 
 OBJECT_MODEL = "yolo11n.pt"
 POSE_MODEL = "yolo11n-pose.pt"
@@ -1030,7 +1030,7 @@ except Exception:
 
 
 @GPU_DECORATOR(
-    duration=15
+    duration=8
 )
 def run_gpu_inference(
     frame,
@@ -1218,6 +1218,8 @@ class LifeVisionEngine:
 
         self.latest_frame = None
         self.latest_frame_time = 0.0
+        self.latest_frame_sequence = 0
+        self.processed_frame_sequence = 0
 
         self.frame_id = 0
         self.camera_frames = 0
@@ -1226,6 +1228,9 @@ class LifeVisionEngine:
         self.process_fps_target = 4.0
         self.last_ai_time = 0.0
         self.ai_times = deque(
+            maxlen=20
+        )
+        self.ai_timestamps = deque(
             maxlen=20
         )
 
@@ -1282,19 +1287,18 @@ class LifeVisionEngine:
             "Start the camera to begin LifeVision."
         )
 
-        self.processing_lock = threading.Lock()
-
         self.worker_condition = threading.Condition()
         self.worker_running = True
+
         self.worker_thread = threading.Thread(
             target=self.ai_worker,
             daemon=True
         )
+
         self.worker_thread.start()
 
         self.last_ai_duration = 0.0
         self.ai_cycle = 0
-
         self.last_pose_cycle = -1
 
     def update_config(
@@ -1402,6 +1406,8 @@ class LifeVisionEngine:
                 time.time()
             )
 
+            self.latest_frame_sequence += 1
+
             objects = list(
                 self.render_objects
             )
@@ -1428,14 +1434,16 @@ class LifeVisionEngine:
 
             snapshot = self.latest_snapshot
 
+            data = self.format_snapshot(
+                snapshot
+            )
+
         with self.worker_condition:
             self.worker_condition.notify()
 
         return (
             rendered,
-            self.format_snapshot(
-                snapshot
-            )
+            data
         )
 
     def ai_worker(self):
@@ -1462,6 +1470,12 @@ class LifeVisionEngine:
             if self.latest_frame is None:
                 return
 
+            if (
+                self.latest_frame_sequence
+                <= self.processed_frame_sequence
+            ):
+                return
+
             now = time.time()
 
             interval = (
@@ -1480,24 +1494,37 @@ class LifeVisionEngine:
 
             frame = self.latest_frame.copy()
 
+            frame_sequence = (
+                self.latest_frame_sequence
+            )
+
             mode = self.mode
+
             object_confidence = (
                 self.object_confidence
             )
+
             pose_confidence = (
                 self.pose_confidence
             )
+
             groups = list(
                 self.groups
             )
+
             show_pose = self.show_pose
+
             hand_confidence = (
                 self.hand_confidence
             )
+
             show_hands = self.show_hands
 
             self.frame_id += 1
-            current_frame_id = self.frame_id
+
+            current_frame_id = (
+                self.frame_id
+            )
 
             self.ai_cycle += 1
 
@@ -1511,6 +1538,9 @@ class LifeVisionEngine:
             )
 
             self.last_ai_time = now
+            self.processed_frame_sequence = (
+                frame_sequence
+            )
 
         started = time.time()
 
@@ -1532,8 +1562,6 @@ class LifeVisionEngine:
                 f"{type(exc).__name__}: {exc}"
             )
 
-        processing_started = time.time()
-
         try:
             output, snapshot = (
                 self.process_ai_result(
@@ -1553,11 +1581,18 @@ class LifeVisionEngine:
 
             with self.lock:
                 self.last_ai_duration = duration
+
                 self.ai_times.append(
                     duration
                 )
 
-                self.latest_snapshot = snapshot
+                self.ai_timestamps.append(
+                    time.time()
+                )
+
+                self.latest_snapshot = (
+                    snapshot
+                )
 
                 self.render_objects = list(
                     snapshot.objects
@@ -1579,7 +1614,11 @@ class LifeVisionEngine:
                     snapshot.narrative
                 )
 
-                self.latest_output = output
+                self.latest_output = (
+                    output
+                )
+
+                self.gpu_error = ""
 
                 if run_pose:
                     self.last_pose_cycle = (
@@ -1682,48 +1721,20 @@ class LifeVisionEngine:
             people
         )
 
-        processing_time = max(
-            0.0001,
-            time.time()
-            -
-            self.last_ai_time
-        )
-
-        stable_ai_fps = (
-            1.0 /
-            max(
-                0.0001,
-                processing_time
-            )
-        )
-
-        if self.ai_times:
-            average_processing = (
-                sum(
-                    self.ai_times
-                )
-                /
-                len(
-                    self.ai_times
-                )
+        with self.lock:
+            ai_fps = self.calculate_ai_fps()
+            camera_fps = (
+                self.calculate_camera_fps()
             )
 
-            stable_ai_fps = (
-                1.0 /
-                max(
-                    0.0001,
-                    average_processing
+            runtime_error = ""
+
+            if self.gpu_error:
+                runtime_error = (
+                    self.gpu_error
                 )
-            )
 
         now = time.time()
-
-        runtime_error = ""
-
-        if self.gpu_error:
-            runtime_error = (
-                self.gpu_error
-            )
 
         snapshot = Snapshot(
             timestamp=now,
@@ -1733,8 +1744,8 @@ class LifeVisionEngine:
             hands=list(hands),
             scene=scene,
             narrative=narrative,
-            fps=self.calculate_camera_fps(),
-            ai_fps=stable_ai_fps,
+            fps=camera_fps,
+            ai_fps=ai_fps,
             hand_available=(
                 self.hand_engine.available
             ),
@@ -1762,6 +1773,29 @@ class LifeVisionEngine:
             output,
             snapshot
         )
+
+    def calculate_ai_fps(self):
+        if len(
+            self.ai_timestamps
+        ) < 2:
+            return 0.0
+
+        timestamps = list(
+            self.ai_timestamps
+        )
+
+        elapsed = (
+            timestamps[-1]
+            -
+            timestamps[0]
+        )
+
+        if elapsed <= 0:
+            return 0.0
+
+        return (
+            len(timestamps) - 1
+        ) / elapsed
 
     def get_output(self):
         with self.lock:
@@ -2886,26 +2920,9 @@ class LifeVisionEngine:
             self.calculate_camera_fps()
         )
 
-        ai_fps = 0.0
-
-        if self.ai_times:
-            average = (
-                sum(
-                    self.ai_times
-                )
-                /
-                len(
-                    self.ai_times
-                )
-            )
-
-            ai_fps = (
-                1.0 /
-                max(
-                    0.0001,
-                    average
-                )
-            )
+        ai_fps = (
+            self.calculate_ai_fps()
+        )
 
         line1 = (
             f"LIFEVISION  |  "
@@ -3218,6 +3235,10 @@ def clear_event_log():
 
 
 CSS = """
+#camera_input {
+    min-height: 1px;
+}
+
 #camera_output {
     min-height: 560px;
 }
@@ -3257,11 +3278,18 @@ with gr.Blocks(
             scale=7,
             min_width=600
         ):
+
             camera = gr.Image(
                 sources=["webcam"],
                 type="numpy",
                 streaming=True,
                 label="LifeVision Camera",
+                elem_id="camera_input"
+            )
+
+            camera_output = gr.Image(
+                type="numpy",
+                label="LiveVision Output",
                 elem_id="camera_output"
             )
 
@@ -3481,7 +3509,7 @@ with gr.Blocks(
     ]
 
     stream_outputs = [
-        camera,
+        camera_output,
         metrics,
         scene,
         narrative,
@@ -3496,7 +3524,7 @@ with gr.Blocks(
         fn=process_frame,
         inputs=stream_inputs,
         outputs=stream_outputs,
-        stream_every=0.03,
+        stream_every=0.04,
         concurrency_limit=1
     )
 
