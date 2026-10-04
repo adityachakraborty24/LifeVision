@@ -6,6 +6,11 @@ import urllib.request
 from dataclasses import dataclass, field
 from collections import deque
 
+try:
+    import spaces
+except Exception:
+    spaces = None
+
 import cv2
 import numpy as np
 import gradio as gr
