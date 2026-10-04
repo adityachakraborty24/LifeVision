@@ -33,7 +33,7 @@ except Exception:
     MEDIAPIPE_AVAILABLE = False
 
 
-APP_VERSION = "20.0"
+APP_VERSION = "21.0"
 
 MODE_OBJECTS = "General Awareness"
 MODE_GESTURE = "Human & Body Awareness"
@@ -228,6 +228,7 @@ class PersonState:
     body_language: str = "Unknown"
     arm_state: str = "Unknown"
     leg_state: str = "Unknown"
+    hand_activity: str = "No hand activity confirmed"
     phone_status: str = "No phone interaction confirmed"
     body_history: deque = field(default_factory=lambda: deque(maxlen=5))
 
@@ -979,9 +980,9 @@ class HandLandmarkerEngine:
                     vision.RunningMode.IMAGE
                 ),
                 num_hands=2,
-                min_hand_detection_confidence=0.35,
-                min_hand_presence_confidence=0.35,
-                min_tracking_confidence=0.35
+                min_hand_detection_confidence=0.25,
+                min_hand_presence_confidence=0.25,
+                min_tracking_confidence=0.25
             )
         )
 
@@ -1009,7 +1010,7 @@ class HandLandmarkerEngine:
 
         try:
             height, width = frame.shape[:2]
-            scale_factor = 1.35
+            scale_factor = 1.60
             target_width = min(1280, max(width, int(width * scale_factor)))
             target_height = min(960, max(height, int(height * scale_factor)))
             enlarged = cv2.resize(
@@ -1017,10 +1018,7 @@ class HandLandmarkerEngine:
                 (target_width, target_height),
                 interpolation=cv2.INTER_LINEAR
             )
-            rgb = cv2.cvtColor(
-                enlarged,
-                cv2.COLOR_BGR2RGB
-            )
+            rgb = np.ascontiguousarray(enlarged)
 
             image = mp.Image(
                 image_format=(
@@ -1120,9 +1118,9 @@ class HandLandmarkerEngine:
                 )
 
                 if (
-                    bbox_width < 0.012
+                    bbox_width < 0.008
                     or
-                    bbox_height < 0.012
+                    bbox_height < 0.008
                 ):
                     continue
 
@@ -2819,120 +2817,321 @@ class LifeVisionEngine:
         return " ".join(parts)
 
     def analyze_body_language(self, people, objects, hands, width, height):
-        phones = [obj for obj in objects if obj.label == "cell phone"]
+        phones = [
+            obj
+            for obj in objects
+            if obj.label == "cell phone"
+        ]
+
+        def point_from_keypoints(kp, index, minimum=0.30):
+            if index >= len(kp) or len(kp[index]) < 3:
+                return None
+            if float(kp[index][2]) < minimum:
+                return None
+            return np.array(
+                [float(kp[index][0]), float(kp[index][1])],
+                dtype=np.float32
+            )
+
+        def hand_center(hand):
+            return np.array(
+                [
+                    ((hand.bbox[0] + hand.bbox[2]) * 0.5) * width,
+                    ((hand.bbox[1] + hand.bbox[3]) * 0.5) * height
+                ],
+                dtype=np.float32
+            )
+
+        def hand_position(center, nose, shoulder, hip, person_bbox):
+            if nose is not None:
+                face_distance = float(np.linalg.norm(center - nose))
+                face_scale = max(35.0, abs(person_bbox[2] - person_bbox[0]) * 0.18)
+                if face_distance < face_scale * 1.8:
+                    return "near face"
+
+            if shoulder is not None:
+                shoulder_distance = float(np.linalg.norm(center - shoulder))
+                shoulder_scale = max(45.0, abs(person_bbox[2] - person_bbox[0]) * 0.28)
+                if shoulder_distance < shoulder_scale * 1.8:
+                    return "near upper body"
+
+            if hip is not None:
+                hip_distance = float(np.linalg.norm(center - hip))
+                hip_scale = max(50.0, abs(person_bbox[2] - person_bbox[0]) * 0.30)
+                if hip_distance < hip_scale * 1.7:
+                    return "near waist"
+
+            if center[1] < person_bbox[1] + abs(person_bbox[3] - person_bbox[1]) * 0.20:
+                return "above head"
+
+            if center[0] < person_bbox[0] + abs(person_bbox[2] - person_bbox[0]) * 0.35:
+                return "left side"
+
+            if center[0] > person_bbox[0] + abs(person_bbox[2] - person_bbox[0]) * 0.65:
+                return "right side"
+
+            return "in front of body"
+
         for person in people:
             person.arm_state = "Arms not clearly visible"
             person.leg_state = "Legs not clearly visible"
+            person.hand_activity = "No hand activity confirmed"
             person.body_language = "Body position unclear"
             person.phone_status = "No phone interaction confirmed"
 
             kp = person.keypoints
+            nose = None
+            ls = rs = le = re = lw = rw = lh = rh = lk = rk = la = ra = None
+
             if len(kp) >= 17:
-                def point(index, minimum=0.35):
-                    if index >= len(kp) or len(kp[index]) < 3:
-                        return None
-                    if kp[index][2] < minimum:
-                        return None
-                    return np.array([kp[index][0], kp[index][1]], dtype=np.float32)
+                nose = point_from_keypoints(kp, 0)
+                ls = point_from_keypoints(kp, 5)
+                rs = point_from_keypoints(kp, 6)
+                le = point_from_keypoints(kp, 7)
+                re = point_from_keypoints(kp, 8)
+                lw = point_from_keypoints(kp, 9)
+                rw = point_from_keypoints(kp, 10)
+                lh = point_from_keypoints(kp, 11)
+                rh = point_from_keypoints(kp, 12)
+                lk = point_from_keypoints(kp, 13)
+                rk = point_from_keypoints(kp, 14)
+                la = point_from_keypoints(kp, 15)
+                ra = point_from_keypoints(kp, 16)
 
-                nose = point(0)
-                ls = point(5)
-                rs = point(6)
-                le = point(7)
-                re = point(8)
-                lw = point(9)
-                rw = point(10)
-                lh = point(11)
-                rh = point(12)
-                lk = point(13)
-                rk = point(14)
-                la = point(15)
-                ra = point(16)
+            shoulder = None if ls is None or rs is None else (ls + rs) / 2.0
+            hip = None if lh is None or rh is None else (lh + rh) / 2.0
+            shoulder_width = 0.0 if ls is None or rs is None else float(np.linalg.norm(ls - rs))
+            person_width = max(30.0, abs(person.bbox[2] - person.bbox[0]))
+            torso_scale = max(30.0, shoulder_width, person_width * 0.18)
 
-                shoulder = None if ls is None or rs is None else (ls + rs) / 2.0
-                hip = None if lh is None or rh is None else (lh + rh) / 2.0
-                shoulder_width = 0.0 if ls is None or rs is None else float(np.linalg.norm(ls-rs))
-                torso_scale = max(shoulder_width, 30.0)
+            left_raised = (
+                lw is not None
+                and ls is not None
+                and lw[1] < ls[1] - torso_scale * 0.12
+            )
+            right_raised = (
+                rw is not None
+                and rs is not None
+                and rw[1] < rs[1] - torso_scale * 0.12
+            )
 
-                raised = []
-                if lw is not None and ls is not None:
-                    raised.append(lw[1] < ls[1] - torso_scale * 0.18)
+            if left_raised and right_raised:
+                person.arm_state = "Both arms raised"
+            elif left_raised:
+                person.arm_state = "Left arm raised"
+            elif right_raised:
+                person.arm_state = "Right arm raised"
+            elif lw is not None and rw is not None:
+                elbow_activity = False
+                if le is not None and re is not None and shoulder is not None:
+                    elbow_activity = (
+                        float(np.linalg.norm(le - shoulder)) > torso_scale * 0.35
+                        or
+                        float(np.linalg.norm(re - shoulder)) > torso_scale * 0.35
+                    )
+                person.arm_state = "Arms active" if elbow_activity else "Arms down"
+            elif lw is not None or rw is not None:
+                person.arm_state = "One arm visible"
+
+            if lk is not None and rk is not None and lh is not None and rh is not None:
+                knee_y = (lk[1] + rk[1]) * 0.5
+                hip_y = (lh[1] + rh[1]) * 0.5
+                leg_span = max(20.0, abs(hip_y - knee_y))
+                if knee_y > hip_y + leg_span * 0.20:
+                    person.leg_state = "Legs bent"
                 else:
-                    raised.append(False)
-                if rw is not None and rs is not None:
-                    raised.append(rw[1] < rs[1] - torso_scale * 0.18)
-                else:
-                    raised.append(False)
+                    person.leg_state = "Legs extended"
+            elif lk is not None or rk is not None:
+                person.leg_state = "One leg visible"
 
-                if raised == [True, True]:
-                    person.arm_state = "Both arms raised"
-                elif raised[0]:
-                    person.arm_state = "Left arm raised"
-                elif raised[1]:
-                    person.arm_state = "Right arm raised"
-                elif lw is not None and rw is not None and shoulder is not None:
-                    if lw[1] < shoulder[1] + torso_scale * 0.45 and rw[1] < shoulder[1] + torso_scale * 0.45:
-                        person.arm_state = "Arms active"
+            visible_hands = []
+            for hand in person.hands:
+                center = hand_center(hand)
+                position = hand_position(
+                    center,
+                    nose,
+                    shoulder,
+                    hip,
+                    person.bbox
+                )
+                visible_hands.append(
+                    (hand, position)
+                )
+
+            if visible_hands:
+                activity_parts = []
+                for hand, position in visible_hands:
+                    gesture = hand.gesture or "Hand detected"
+                    if gesture in {"Hand detected", "Hand gesture"}:
+                        activity_parts.append(
+                            f"{hand.handedness} hand {position}"
+                        )
                     else:
-                        person.arm_state = "Arms down"
-                elif lw is not None or rw is not None:
-                    person.arm_state = "One arm visible"
+                        activity_parts.append(
+                            f"{gesture} with {hand.handedness.lower()} hand {position}"
+                        )
+                person.hand_activity = "; ".join(activity_parts)
 
-                if lk is not None and rk is not None and lh is not None and rh is not None:
-                    knee_height = ((lk[1] + rk[1]) / 2.0)
-                    hip_height = ((lh[1] + rh[1]) / 2.0)
-                    if knee_height > hip_height + torso_scale * 0.08:
-                        person.leg_state = "Legs bent"
-                    else:
-                        person.leg_state = "Legs extended"
-                elif lk is not None or rk is not None:
-                    person.leg_state = "One leg visible"
-
-                posture = person.posture
-                body_parts = []
-                if posture != "Unknown":
-                    body_parts.append(posture)
-                if person.arm_state not in {"Arms not clearly visible", "Arms down"}:
-                    body_parts.append(person.arm_state.lower())
-                if person.leg_state == "Legs bent" and posture not in {"Sitting", "Lying"}:
-                    body_parts.append("legs bent")
-                if person.movement != "Still":
-                    body_parts.append(person.movement.lower())
-
-                if nose is not None:
-                    for wrist in [lw, rw]:
-                        if wrist is not None and np.linalg.norm(wrist - nose) < torso_scale * 1.15:
-                            body_parts.append("hand near face")
+            phone_hand = False
+            phone_near_person = False
+            for phone in phones:
+                phone_center = np.array(
+                    [float(phone.center[0]), float(phone.center[1])],
+                    dtype=np.float32
+                )
+                phone_scale = max(25.0, math.sqrt(max(phone.area, 1)))
+                for wrist in [lw, rw]:
+                    if wrist is not None:
+                        wrist_distance = float(np.linalg.norm(wrist - phone_center))
+                        if wrist_distance < max(person_width * 0.20, phone_scale * 2.8):
+                            phone_hand = True
                             break
+                if phone_hand:
+                    break
 
-                if not body_parts:
-                    body_parts.append("body visible")
+                x1, y1, x2, y2 = person.bbox
+                if (
+                    x1 - person_width * 0.15 <= phone.center[0] <= x2 + person_width * 0.15
+                    and
+                    y1 - person_width * 0.15 <= phone.center[1] <= y2 + person_width * 0.15
+                ):
+                    phone_near_person = True
 
-                candidate = ", ".join(dict.fromkeys(body_parts))
-                person.body_history.append(candidate)
-                counts = Counter(person.body_history)
-                person.body_language = counts.most_common(1)[0][0]
+            if phone_hand:
+                person.phone_status = "Phone likely being held"
+            elif phone_near_person:
+                person.phone_status = "Phone near person; holding not confirmed"
 
-                for phone in phones:
-                    px, py = phone.center
-                    phone_scale = max(30.0, math.sqrt(max(phone.area, 1)))
-                    near_hand = False
-                    for wrist in [lw, rw]:
-                        if wrist is not None:
-                            if np.linalg.norm(wrist - np.array([px, py], dtype=np.float32)) < max(torso_scale * 1.2, phone_scale * 2.0):
-                                near_hand = True
-                                break
-                    if near_hand:
-                        person.phone_status = "Holding phone"
-                        break
+            body_parts = []
+            if person.posture != "Unknown":
+                body_parts.append(person.posture)
+            if person.arm_state not in {"Arms not clearly visible", "Arms down"}:
+                body_parts.append(person.arm_state.lower())
+            if person.leg_state == "Legs bent" and person.posture not in {"Sitting", "Lying"}:
+                body_parts.append("legs bent")
+            if person.movement != "Still":
+                body_parts.append(person.movement.lower())
+            if visible_hands:
+                near_face = any(position == "near face" for _, position in visible_hands)
+                if near_face:
+                    body_parts.append("using a hand near the face")
 
-                if person.phone_status != "Holding phone":
-                    x1, y1, x2, y2 = person.bbox
-                    for phone in phones:
-                        px, py = phone.center
-                        if x1 - 30 <= px <= x2 + 30 and y1 - 30 <= py <= y2 + 30:
-                            person.phone_status = "Phone near person"
-                            break
+            if not body_parts:
+                body_parts.append("body visible")
+
+            candidate = ", ".join(dict.fromkeys(body_parts))
+            person.body_history.append(candidate)
+            counts = Counter(person.body_history)
+            person.body_language = counts.most_common(1)[0][0]
+
+    def build_body_scene(self, people, hands):
+        if not people and not hands:
+            return "No confirmed human body or hands"
+        if len(people) > 1:
+            if len(hands) > 0:
+                return "Multiple people with body and hands visible"
+            return "Multiple people with bodies visible"
+        if len(people) == 1:
+            person = people[0]
+            if person.phone_status == "Phone likely being held":
+                return "Person likely holding a phone"
+            if len(hands) == 2:
+                return "Person with two hands detected"
+            if len(hands) == 1:
+                return "Person with one hand detected"
+            if person.posture != "Unknown":
+                return f"Person {person.posture.lower()}"
+            return "Single person with body visible"
+        if len(hands) == 2:
+            return "Two hands detected"
+        return "One hand detected"
+
+    def build_body_narrative(self, people, hands, scene):
+        parts = []
+
+        if not people:
+            if len(hands) == 2:
+                parts.append("2 hands are detected, but no full person is currently confirmed.")
+            elif len(hands) == 1:
+                parts.append("1 hand is detected, but no full person is currently confirmed.")
+            else:
+                parts.append("No person or hand is currently confirmed.")
+        else:
+            parts.append(
+                f"{len(people)} person"
+                + (" is" if len(people) == 1 else "s are")
+                + " confirmed."
+            )
+
+        if hands:
+            gesture_counts = Counter(
+                hand.gesture
+                for hand in hands
+                if hand.gesture not in {"Hand detected", "Hand gesture"}
+            )
+            if gesture_counts:
+                parts.append(
+                    "Detected hand actions: "
+                    + ", ".join(
+                        f"{gesture} ({count})" if count > 1 else gesture
+                        for gesture, count in gesture_counts.items()
+                    )
+                    + "."
+                )
+            else:
+                parts.append(
+                    "Hands are detected, but no specific gesture is stable enough to identify."
+                )
+
+        for person in sorted(people, key=lambda p: p.person_id):
+            details = [
+                f"posture: {person.posture}",
+                f"movement: {person.movement}",
+                f"arms: {person.arm_state}",
+                f"legs: {person.leg_state}"
+            ]
+
+            if person.hands:
+                details.append(
+                    f"hand activity: {person.hand_activity}"
+                )
+            else:
+                details.append(
+                    "hand activity: no hand landmark confirmed"
+                )
+
+            if person.phone_status != "No phone interaction confirmed":
+                details.append(person.phone_status)
+
+            explanation = []
+            if "near face" in person.hand_activity:
+                explanation.append(
+                    "the hand landmark is close to the detected face/ nose region"
+                )
+            if person.phone_status == "Phone likely being held":
+                explanation.append(
+                    "the detected phone is close to a detected wrist"
+                )
+            elif person.phone_status == "Phone near person; holding not confirmed":
+                explanation.append(
+                    "the phone is inside or close to the person's body region, but wrist proximity is insufficient to confirm holding"
+                )
+
+            if explanation:
+                details.append(
+                    "reason: " + "; ".join(explanation)
+                )
+
+            parts.append(
+                f"Person {person.person_id}: "
+                + ", ".join(details)
+                + "."
+            )
+
+        parts.append(
+            f"Human scene: {scene}."
+        )
+        return " ".join(parts).replace("\n", " ")
 
     def build_body_scene(self, people, hands):
         if not people and not hands:
