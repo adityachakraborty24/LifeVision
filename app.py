@@ -33,11 +33,10 @@ except Exception:
     MEDIAPIPE_AVAILABLE = False
 
 
-APP_VERSION = "19.0"
+APP_VERSION = "20.0"
 
-MODE_OBJECTS = "Object & People Awareness"
-MODE_GESTURE = "Gesture & Body Awareness"
-MODE_SCENE = "Live Scene"
+MODE_OBJECTS = "General Awareness"
+MODE_GESTURE = "Human & Body Awareness"
 
 OBJECT_MODEL = "yolo11n.pt"
 POSE_MODEL = "yolo11n-pose.pt"
@@ -226,6 +225,11 @@ class PersonState:
         default_factory=lambda: deque(maxlen=20)
     )
     last_update: float = 0.0
+    body_language: str = "Unknown"
+    arm_state: str = "Unknown"
+    leg_state: str = "Unknown"
+    phone_status: str = "No phone interaction confirmed"
+    body_history: deque = field(default_factory=lambda: deque(maxlen=5))
 
 
 @dataclass
@@ -348,12 +352,12 @@ class MotionAnalyzer:
 
 class GestureRecognizer:
     def __init__(self):
-        self.finger_pairs = {
-            "index": (8, 6),
-            "middle": (12, 10),
-            "ring": (16, 14),
-            "pinky": (20, 18)
-        }
+        self.finger_data = [
+            (8, 6, 5),
+            (12, 10, 9),
+            (16, 14, 13),
+            (20, 18, 17)
+        ]
 
     def distance(self, a, b):
         return math.sqrt(
@@ -363,301 +367,83 @@ class GestureRecognizer:
         )
 
     def angle(self, a, b, c):
-        ba = np.array(a) - np.array(b)
-        bc = np.array(c) - np.array(b)
-
-        denom = (
-            np.linalg.norm(ba) *
-            np.linalg.norm(bc)
-        )
-
-        if denom <= 1e-8:
+        ba = np.array(a, dtype=np.float32) - np.array(b, dtype=np.float32)
+        bc = np.array(c, dtype=np.float32) - np.array(b, dtype=np.float32)
+        denom = np.linalg.norm(ba) * np.linalg.norm(bc)
+        if denom <= 1e-7:
             return 180.0
+        value = np.clip(np.dot(ba, bc) / denom, -1.0, 1.0)
+        return math.degrees(math.acos(value))
 
-        cosine = np.clip(
-            np.dot(ba, bc) / denom,
-            -1.0,
-            1.0
-        )
+    def palm_scale(self, landmarks):
+        scale = self.distance(landmarks[0], landmarks[9])
+        return max(scale, 0.025)
 
-        return math.degrees(
-            math.acos(cosine)
-        )
-
-    def normalized_scale(self, landmarks):
+    def finger_extended(self, landmarks, tip, pip, mcp):
+        scale = self.palm_scale(landmarks)
         wrist = landmarks[0]
-        middle_mcp = landmarks[9]
-
-        scale = self.distance(
-            wrist,
-            middle_mcp
-        )
-
-        if scale < 0.02:
-            scale = 0.02
-
-        return scale
-
-    def finger_extended(
-        self,
-        landmarks,
-        tip,
-        pip
-    ):
-        wrist = landmarks[0]
-        mcp = landmarks[pip - 1]
-        pip_point = landmarks[pip]
         tip_point = landmarks[tip]
-
-        scale = self.normalized_scale(
-            landmarks
-        )
-
-        wrist_tip = (
-            self.distance(
-                wrist,
-                tip_point
-            )
-            / scale
-        )
-
-        wrist_pip = (
-            self.distance(
-                wrist,
-                pip_point
-            )
-            / scale
-        )
-
-        joint_angle = self.angle(
-            mcp,
-            pip_point,
-            tip_point
-        )
-
-        return (
-            wrist_tip >
-            wrist_pip * 1.08
-            and
-            joint_angle > 145
-        )
+        pip_point = landmarks[pip]
+        mcp_point = landmarks[mcp]
+        wrist_tip = self.distance(wrist, tip_point) / scale
+        wrist_pip = self.distance(wrist, pip_point) / scale
+        bend = self.angle(mcp_point, pip_point, tip_point)
+        return wrist_tip > wrist_pip * 1.04 and bend > 145.0
 
     def thumb_extended(self, landmarks):
-        scale = self.normalized_scale(
-            landmarks
-        )
-
-        wrist = landmarks[0]
-        thumb_tip = landmarks[4]
-        thumb_ip = landmarks[3]
-        thumb_mcp = landmarks[2]
-
-        tip_distance = (
-            self.distance(
-                wrist,
-                thumb_tip
-            )
-            / scale
-        )
-
-        ip_distance = (
-            self.distance(
-                wrist,
-                thumb_ip
-            )
-            / scale
-        )
-
-        joint_angle = self.angle(
-            landmarks[1],
-            thumb_mcp,
-            thumb_ip
-        )
-
-        return (
-            tip_distance >
-            ip_distance * 1.03
-            and
-            joint_angle > 125
-        )
+        scale = self.palm_scale(landmarks)
+        bend = self.angle(landmarks[1], landmarks[2], landmarks[3])
+        reach = self.distance(landmarks[0], landmarks[4]) / scale
+        return reach > 1.05 and bend > 135.0
 
     def classify(self, landmarks):
         if len(landmarks) != 21:
             return "Hand detected"
 
-        scale = self.normalized_scale(
-            landmarks
-        )
-
+        scale = self.palm_scale(landmarks)
         if scale < 0.025:
             return "Hand detected"
 
-        thumb = self.thumb_extended(
-            landmarks
-        )
-
-        index = self.finger_extended(
-            landmarks,
-            8,
-            6
-        )
-
-        middle = self.finger_extended(
-            landmarks,
-            12,
-            10
-        )
-
-        ring = self.finger_extended(
-            landmarks,
-            16,
-            14
-        )
-
-        pinky = self.finger_extended(
-            landmarks,
-            20,
-            18
-        )
-
-        extended = [
-            thumb,
-            index,
-            middle,
-            ring,
-            pinky
+        thumb = self.thumb_extended(landmarks)
+        fingers = [
+            self.finger_extended(landmarks, tip, pip, mcp)
+            for tip, pip, mcp in self.finger_data
         ]
+        index, middle, ring, pinky = fingers
+        count = sum(fingers) + int(thumb)
+        pinch = self.distance(landmarks[4], landmarks[8]) / scale
 
-        extended_count = sum(
-            extended
-        )
-
-        thumb_tip = np.array(
-            landmarks[4]
-        )
-
-        thumb_mcp = np.array(
-            landmarks[2]
-        )
-
-        index_tip = np.array(
-            landmarks[8]
-        )
-
-        thumb_index_distance = (
-            self.distance(
-                landmarks[4],
-                landmarks[8]
-            )
-            / scale
-        )
-
-        if (
-            thumb_index_distance < 0.42
-            and
-            index
-            and
-            not middle
-            and
-            not ring
-            and
-            not pinky
-        ):
+        if pinch < 0.38 and index and not middle and not ring and not pinky:
             return "Pinch"
 
-        if (
-            thumb_index_distance < 0.55
-            and
-            middle
-            and
-            ring
-            and
-            pinky
-        ):
+        if pinch < 0.48 and middle and ring and pinky and thumb:
             return "OK"
 
-        if extended_count == 0:
+        if not any(fingers) and not thumb:
             return "Fist"
 
-        if (
-            index
-            and
-            middle
-            and
-            not ring
-            and
-            not pinky
-            and
-            not thumb
-        ):
+        if index and middle and not ring and not pinky:
             return "Peace"
 
-        if (
-            index
-            and
-            not middle
-            and
-            not ring
-            and
-            not pinky
-            and
-            not thumb
-        ):
+        if index and not middle and not ring and not pinky:
             return "Pointing"
 
-        if (
-            thumb
-            and
-            not index
-            and
-            not middle
-            and
-            not ring
-            and
-            not pinky
-        ):
-            vertical_difference = (
-                thumb_tip[1] -
-                thumb_mcp[1]
-            )
-
-            if vertical_difference < -0.10 * scale:
+        if thumb and not index and not middle and not ring and not pinky:
+            dy = landmarks[4][1] - landmarks[2][1]
+            if dy < -0.07 * scale:
                 return "Thumbs up"
-
-            if vertical_difference > 0.10 * scale:
+            if dy > 0.07 * scale:
                 return "Thumbs down"
-
             return "Thumbs up"
 
-        if extended_count >= 4:
+        if count >= 5:
             return "Open hand"
 
-        if (
-            index
-            and
-            middle
-            and
-            ring
-            and
-            not pinky
-        ):
+        if index and middle and ring and not pinky:
             return "Three fingers"
 
-        if (
-            index
-            and
-            middle
-            and
-            ring
-            and
-            pinky
-            and
-            not thumb
-        ):
+        if index and middle and ring and pinky and not thumb:
             return "Four fingers"
-
-        if extended_count == 1:
-            return "Hand gesture"
 
         return "Hand detected"
 
@@ -1193,9 +979,9 @@ class HandLandmarkerEngine:
                     vision.RunningMode.IMAGE
                 ),
                 num_hands=2,
-                min_hand_detection_confidence=0.40,
-                min_hand_presence_confidence=0.40,
-                min_tracking_confidence=0.40
+                min_hand_detection_confidence=0.35,
+                min_hand_presence_confidence=0.35,
+                min_tracking_confidence=0.35
             )
         )
 
@@ -1222,8 +1008,17 @@ class HandLandmarkerEngine:
             return []
 
         try:
-            rgb = cv2.cvtColor(
+            height, width = frame.shape[:2]
+            scale_factor = 1.35
+            target_width = min(1280, max(width, int(width * scale_factor)))
+            target_height = min(960, max(height, int(height * scale_factor)))
+            enlarged = cv2.resize(
                 frame,
+                (target_width, target_height),
+                interpolation=cv2.INTER_LINEAR
+            )
+            rgb = cv2.cvtColor(
+                enlarged,
                 cv2.COLOR_BGR2RGB
             )
 
@@ -1325,9 +1120,9 @@ class HandLandmarkerEngine:
                 )
 
                 if (
-                    bbox_width < 0.025
+                    bbox_width < 0.012
                     or
-                    bbox_height < 0.025
+                    bbox_height < 0.012
                 ):
                     continue
 
@@ -1525,18 +1320,16 @@ def run_gpu_inference(
 
     allowed = set()
 
-    if mode == MODE_GESTURE:
-        allowed.add("person")
-    else:
-        for group in groups:
-            allowed.update(
-                OBJECT_GROUPS.get(
-                    group,
-                    []
-                )
+    for group in groups:
+        allowed.update(
+            OBJECT_GROUPS.get(
+                group,
+                []
             )
+        )
 
-        allowed.add("person")
+    allowed.add("person")
+    allowed.add("cell phone")
 
     object_output = []
     object_error = ""
@@ -1548,8 +1341,8 @@ def run_gpu_inference(
                 object_confidence
             ),
             iou=0.45,
-            imgsz=320,
-            max_det=30,
+            imgsz=416,
+            max_det=40,
             device="cuda",
             verbose=False
         )[0]
@@ -1643,8 +1436,8 @@ def run_gpu_inference(
                     pose_confidence
                 ),
                 iou=0.45,
-                imgsz=320,
-                max_det=10,
+                imgsz=416,
+                max_det=12,
                 device="cuda",
                 verbose=False
             )[0]
@@ -1733,7 +1526,7 @@ class LifeVisionEngine:
             maxlen=20
         )
 
-        self.mode = MODE_SCENE
+        self.mode = MODE_OBJECTS
 
         self.object_confidence = 0.35
         self.pose_confidence = 0.35
@@ -1827,15 +1620,14 @@ class LifeVisionEngine:
         with self.lock:
             self.mode = (
                 mode
-                or MODE_SCENE
+                or MODE_OBJECTS
             )
 
             if self.mode not in {
                 MODE_OBJECTS,
-                MODE_GESTURE,
-                MODE_SCENE
+                MODE_GESTURE
             }:
-                self.mode = MODE_SCENE
+                self.mode = MODE_OBJECTS
 
             self.process_fps_target = max(
                 1.0,
@@ -2089,13 +1881,7 @@ class LifeVisionEngine:
             run_pose = (
                 show_pose
                 and
-                mode != MODE_OBJECTS
-                and
-                (
-                    self.ai_cycle % 2 == 1
-                    or
-                    self.last_pose_cycle < 0
-                )
+                mode == MODE_GESTURE
             )
 
             self.last_ai_time = now
@@ -2260,12 +2046,21 @@ class LifeVisionEngine:
         if (
             show_hands
             and
-            self.mode != MODE_OBJECTS
+            self.mode == MODE_GESTURE
         ):
             hands = self.detect_hands(
                 frame,
                 people,
                 hand_confidence
+            )
+
+        if self.mode == MODE_GESTURE:
+            self.analyze_body_language(
+                people,
+                objects,
+                hands,
+                frame.shape[1],
+                frame.shape[0]
             )
 
         if self.mode == MODE_OBJECTS:
@@ -2785,7 +2580,7 @@ class LifeVisionEngine:
         if (
             not self.show_hands
             or
-            self.mode == MODE_OBJECTS
+            self.mode != MODE_GESTURE
         ):
             return []
 
@@ -3023,141 +2818,185 @@ class LifeVisionEngine:
 
         return " ".join(parts)
 
-    def build_body_scene(
-        self,
-        people,
-        hands
-    ):
+    def analyze_body_language(self, people, objects, hands, width, height):
+        phones = [obj for obj in objects if obj.label == "cell phone"]
+        for person in people:
+            person.arm_state = "Arms not clearly visible"
+            person.leg_state = "Legs not clearly visible"
+            person.body_language = "Body position unclear"
+            person.phone_status = "No phone interaction confirmed"
+
+            kp = person.keypoints
+            if len(kp) >= 17:
+                def point(index, minimum=0.35):
+                    if index >= len(kp) or len(kp[index]) < 3:
+                        return None
+                    if kp[index][2] < minimum:
+                        return None
+                    return np.array([kp[index][0], kp[index][1]], dtype=np.float32)
+
+                nose = point(0)
+                ls = point(5)
+                rs = point(6)
+                le = point(7)
+                re = point(8)
+                lw = point(9)
+                rw = point(10)
+                lh = point(11)
+                rh = point(12)
+                lk = point(13)
+                rk = point(14)
+                la = point(15)
+                ra = point(16)
+
+                shoulder = None if ls is None or rs is None else (ls + rs) / 2.0
+                hip = None if lh is None or rh is None else (lh + rh) / 2.0
+                shoulder_width = 0.0 if ls is None or rs is None else float(np.linalg.norm(ls-rs))
+                torso_scale = max(shoulder_width, 30.0)
+
+                raised = []
+                if lw is not None and ls is not None:
+                    raised.append(lw[1] < ls[1] - torso_scale * 0.18)
+                else:
+                    raised.append(False)
+                if rw is not None and rs is not None:
+                    raised.append(rw[1] < rs[1] - torso_scale * 0.18)
+                else:
+                    raised.append(False)
+
+                if raised == [True, True]:
+                    person.arm_state = "Both arms raised"
+                elif raised[0]:
+                    person.arm_state = "Left arm raised"
+                elif raised[1]:
+                    person.arm_state = "Right arm raised"
+                elif lw is not None and rw is not None and shoulder is not None:
+                    if lw[1] < shoulder[1] + torso_scale * 0.45 and rw[1] < shoulder[1] + torso_scale * 0.45:
+                        person.arm_state = "Arms active"
+                    else:
+                        person.arm_state = "Arms down"
+                elif lw is not None or rw is not None:
+                    person.arm_state = "One arm visible"
+
+                if lk is not None and rk is not None and lh is not None and rh is not None:
+                    knee_height = ((lk[1] + rk[1]) / 2.0)
+                    hip_height = ((lh[1] + rh[1]) / 2.0)
+                    if knee_height > hip_height + torso_scale * 0.08:
+                        person.leg_state = "Legs bent"
+                    else:
+                        person.leg_state = "Legs extended"
+                elif lk is not None or rk is not None:
+                    person.leg_state = "One leg visible"
+
+                posture = person.posture
+                body_parts = []
+                if posture != "Unknown":
+                    body_parts.append(posture)
+                if person.arm_state not in {"Arms not clearly visible", "Arms down"}:
+                    body_parts.append(person.arm_state.lower())
+                if person.leg_state == "Legs bent" and posture not in {"Sitting", "Lying"}:
+                    body_parts.append("legs bent")
+                if person.movement != "Still":
+                    body_parts.append(person.movement.lower())
+
+                if nose is not None:
+                    for wrist in [lw, rw]:
+                        if wrist is not None and np.linalg.norm(wrist - nose) < torso_scale * 1.15:
+                            body_parts.append("hand near face")
+                            break
+
+                if not body_parts:
+                    body_parts.append("body visible")
+
+                candidate = ", ".join(dict.fromkeys(body_parts))
+                person.body_history.append(candidate)
+                counts = Counter(person.body_history)
+                person.body_language = counts.most_common(1)[0][0]
+
+                for phone in phones:
+                    px, py = phone.center
+                    phone_scale = max(30.0, math.sqrt(max(phone.area, 1)))
+                    near_hand = False
+                    for wrist in [lw, rw]:
+                        if wrist is not None:
+                            if np.linalg.norm(wrist - np.array([px, py], dtype=np.float32)) < max(torso_scale * 1.2, phone_scale * 2.0):
+                                near_hand = True
+                                break
+                    if near_hand:
+                        person.phone_status = "Holding phone"
+                        break
+
+                if person.phone_status != "Holding phone":
+                    x1, y1, x2, y2 = person.bbox
+                    for phone in phones:
+                        px, py = phone.center
+                        if x1 - 30 <= px <= x2 + 30 and y1 - 30 <= py <= y2 + 30:
+                            person.phone_status = "Phone near person"
+                            break
+
+    def build_body_scene(self, people, hands):
         if not people and not hands:
             return "No confirmed human body"
-
         if len(people) > 1:
             if len(hands) > 0:
-                return "Multiple people with hands visible"
-            return "Multiple people"
-
+                return "Multiple people with body and hands visible"
+            return "Multiple people with bodies visible"
         if len(people) == 1:
+            person = people[0]
+            if person.phone_status == "Holding phone":
+                return "Person holding phone"
             if len(hands) == 2:
                 return "Person with two hands visible"
-
             if len(hands) == 1:
                 return "Person with one hand visible"
-
-            return "Single person"
-
+            if person.posture != "Unknown":
+                return f"Person {person.posture.lower()}"
+            return "Single person with body visible"
         if len(hands) == 2:
             return "Two hands visible"
-
         return "One hand visible"
 
-    def build_body_narrative(
-        self,
-        people,
-        hands,
-        scene
-    ):
+    def build_body_narrative(self, people, hands, scene):
         parts = []
-
         if not people:
             if len(hands) == 2:
-                parts.append(
-                    "2 hands are detected."
-                )
+                parts.append("2 hands are detected.")
             elif len(hands) == 1:
-                parts.append(
-                    "1 hand is detected."
-                )
+                parts.append("1 hand is detected.")
             else:
-                parts.append(
-                    "No person or hand is currently confirmed."
-                )
+                parts.append("No person or hand is currently confirmed.")
         else:
-            if len(people) == 1:
-                parts.append(
-                    "1 person is confirmed."
-                )
-            else:
-                parts.append(
-                    f"{len(people)} people are confirmed."
-                )
+            parts.append(f"{len(people)} person" + (" is" if len(people) == 1 else "s are") + " confirmed.")
 
         if hands:
-            if len(hands) == 1:
-                parts.append(
-                    "1 hand is visible."
-                )
-            else:
-                parts.append(
-                    f"{len(hands)} hands are visible."
-                )
-
+            parts.append(f"{len(hands)} hand" + (" is" if len(hands) == 1 else "s are") + " visible.")
             gesture_counts = Counter(
-                hand.gesture
-                for hand in hands
-                if hand.gesture
-                not in {
-                    "Hand detected",
-                    "Hand gesture"
-                }
+                hand.gesture for hand in hands
+                if hand.gesture not in {"Hand detected", "Hand gesture"}
             )
-
             if gesture_counts:
-                gesture_text = []
-
-                for gesture, count in (
-                    gesture_counts.items()
-                ):
-                    if count == 1:
-                        gesture_text.append(
-                            gesture
-                        )
-                    else:
-                        gesture_text.append(
-                            f"{gesture} ({count})"
-                        )
-
-                parts.append(
-                    "Recognized gestures: "
-                    +
-                    ", ".join(
-                        gesture_text
-                    )
-                    +
-                    "."
-                )
+                parts.append("Gestures: " + ", ".join(
+                    f"{gesture} ({count})" if count > 1 else gesture
+                    for gesture, count in gesture_counts.items()
+                ) + ".")
             else:
-                parts.append(
-                    "The hands are detected, but no stable specific gesture is confirmed."
-                )
+                parts.append("Hands are detected without a stable specific gesture.")
 
-        for person in people:
-            details = []
+        for person in sorted(people, key=lambda p: p.person_id):
+            details = [
+                f"posture: {person.posture}",
+                f"movement: {person.movement}",
+                f"body language: {person.body_language}",
+                f"arms: {person.arm_state}",
+                f"legs: {person.leg_state}"
+            ]
+            if person.phone_status != "No phone interaction confirmed":
+                details.append(person.phone_status)
+            if person.hands:
+                details.append(f"hands visible: {len(person.hands)}")
+            parts.append(f"Person {person.person_id}: " + ", ".join(details) + ".")
 
-            if person.posture != "Unknown":
-                details.append(
-                    f"posture: {person.posture}"
-                )
-
-            if person.movement != "Still":
-                details.append(
-                    f"movement: {person.movement}"
-                )
-
-            if details:
-                parts.append(
-                    f"Person {person.person_id}: "
-                    +
-                    ", ".join(
-                        details
-                    )
-                    +
-                    "."
-                )
-
-        parts.append(
-            f"Body scene: {scene}."
-        )
-
+        parts.append(f"Human scene: {scene}.")
         return " ".join(parts)
 
     def build_scene(
@@ -3977,7 +3816,10 @@ class LifeVisionEngine:
             line = (
                 f"Person {person.person_id} | "
                 f"{person.posture} | "
-                f"{person.movement}"
+                f"{person.movement} | "
+                f"Body: {person.body_language} | "
+                f"Arms: {person.arm_state} | "
+                f"Legs: {person.leg_state}"
             )
 
             if person.gestures:
@@ -4270,7 +4112,8 @@ with gr.Blocks(
     gr.Markdown(
         """
 # LifeVision
-### Real-Time Computer Vision & Scene Awareness
+### Real-Time Computer Vision, Body & Scene Awareness
+Version 20.0
 """
     )
 
@@ -4338,10 +4181,9 @@ with gr.Blocks(
             mode = gr.Radio(
                 choices=[
                     MODE_OBJECTS,
-                    MODE_GESTURE,
-                    MODE_SCENE
+                    MODE_GESTURE
                 ],
-                value=MODE_SCENE,
+                value=MODE_OBJECTS,
                 label="Mode"
             )
 
@@ -4366,7 +4208,7 @@ with gr.Blocks(
             pose_confidence = gr.Slider(
                 minimum=0.10,
                 maximum=0.90,
-                value=0.35,
+                value=0.40,
                 step=0.05,
                 label="Pose Confidence"
             )
@@ -4374,7 +4216,7 @@ with gr.Blocks(
             hand_confidence = gr.Slider(
                 minimum=0.10,
                 maximum=0.90,
-                value=0.45,
+                value=0.40,
                 step=0.05,
                 label="Hand Confidence"
             )
