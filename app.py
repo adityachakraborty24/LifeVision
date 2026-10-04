@@ -34,7 +34,7 @@ except Exception:
     MEDIAPIPE_AVAILABLE = False
 
 
-APP_VERSION = "22.0"
+APP_VERSION = "23.0"
 
 MODE_OBJECTS = "General Awareness"
 MODE_GESTURE = "Human & Body Awareness"
@@ -1246,11 +1246,7 @@ def _identity_decorator(function=None, **kwargs):
     return function
 
 
-GPU_DECORATOR = (
-    spaces.GPU
-    if spaces is not None
-    else _identity_decorator
-)
+GPU_DECORATOR = _identity_decorator
 
 OBJECT_GPU_MODEL = None
 POSE_GPU_MODEL = None
@@ -1270,28 +1266,14 @@ def get_gpu_models():
                     OBJECT_MODEL
                 )
 
-                if (
-                    torch is not None
-                    and
-                    torch.cuda.is_available()
-                ):
-                    OBJECT_GPU_MODEL.to(
-                        "cuda"
-                    )
+                OBJECT_GPU_MODEL.to("cpu")
 
             if POSE_GPU_MODEL is None:
                 POSE_GPU_MODEL = YOLO(
                     POSE_MODEL
                 )
 
-                if (
-                    torch is not None
-                    and
-                    torch.cuda.is_available()
-                ):
-                    POSE_GPU_MODEL.to(
-                        "cuda"
-                    )
+                POSE_GPU_MODEL.to("cpu")
 
         except Exception as exc:
             MODEL_ERROR = (
@@ -1346,7 +1328,7 @@ def run_gpu_inference(
             iou=0.45,
             imgsz=416,
             max_det=40,
-            device="cuda",
+            device="cpu",
             verbose=False
         )[0]
 
@@ -1429,8 +1411,6 @@ def run_gpu_inference(
         show_pose
         and
         run_pose
-        and
-        mode != MODE_OBJECTS
     ):
         try:
             pose_result = pose_model.predict(
@@ -1441,7 +1421,7 @@ def run_gpu_inference(
                 iou=0.45,
                 imgsz=416,
                 max_det=12,
-                device="cuda",
+                device="cpu",
                 verbose=False
             )[0]
 
@@ -1541,7 +1521,7 @@ class LifeVisionEngine:
 
         self.object_confidence = 0.35
         self.pose_confidence = 0.35
-        self.hand_confidence = 0.45
+        self.hand_confidence = 0.25
 
         self.show_boxes = True
         self.show_pose = True
@@ -1889,11 +1869,7 @@ class LifeVisionEngine:
 
             self.ai_cycle += 1
 
-            run_pose = (
-                show_pose
-                and
-                mode == MODE_GESTURE
-            )
+            run_pose = bool(show_pose)
 
             self.last_ai_time = now
 
@@ -1901,8 +1877,6 @@ class LifeVisionEngine:
 
         if (
             show_hands
-            and
-            mode != MODE_OBJECTS
             and
             not self.hand_engine.initialized
         ):
@@ -2056,11 +2030,7 @@ class LifeVisionEngine:
 
         hands = []
 
-        if (
-            show_hands
-            and
-            self.mode == MODE_GESTURE
-        ):
+        if show_hands:
             hands = self.detect_hands(
                 frame,
                 people,
@@ -2600,8 +2570,6 @@ class LifeVisionEngine:
     ):
         if (
             not self.show_hands
-            or
-            self.mode != MODE_GESTURE
         ):
             return []
 
@@ -4405,7 +4373,7 @@ with gr.Blocks(
         """
 # LifeVision
 ### Real-Time Computer Vision, Body & Scene Awareness
-Version 22.0
+Version 23.0
 """
     )
 
@@ -4500,7 +4468,7 @@ Version 22.0
             object_confidence = gr.Slider(
                 minimum=0.10,
                 maximum=0.90,
-                value=0.35,
+                value=0.25,
                 step=0.05,
                 label="Object Confidence"
             )
@@ -4508,7 +4476,7 @@ Version 22.0
             pose_confidence = gr.Slider(
                 minimum=0.10,
                 maximum=0.90,
-                value=0.40,
+                value=0.25,
                 step=0.05,
                 label="Pose Confidence"
             )
@@ -4516,7 +4484,7 @@ Version 22.0
             hand_confidence = gr.Slider(
                 minimum=0.10,
                 maximum=0.90,
-                value=0.40,
+                value=0.25,
                 step=0.05,
                 label="Hand Confidence"
             )
