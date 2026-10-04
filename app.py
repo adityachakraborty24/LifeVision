@@ -1363,10 +1363,10 @@ def run_gpu_inference(
                     continue
 
                 required_confidence = (
-                    0.35
+                    0.25
                     if label == "person"
                     else max(
-                        0.40,
+                        0.25,
                         float(
                             object_confidence
                         )
@@ -3640,6 +3640,12 @@ class LifeVisionEngine:
                     hand
                 )
 
+            if not hands and people:
+                self.draw_wrist_fallback(
+                    output,
+                    people
+                )
+
         if self.show_hud:
             self.draw_hud(
                 output,
@@ -3711,6 +3717,37 @@ class LifeVisionEngine:
                 -1,
                 cv2.LINE_AA
             )
+
+    def draw_wrist_fallback(
+        self,
+        frame,
+        people
+    ):
+        for person in people:
+            keypoints = person.keypoints or []
+            for index, label in ((9, "L wrist"), (10, "R wrist")):
+                if index >= len(keypoints):
+                    continue
+                point = keypoints[index]
+                if len(point) < 3 or float(point[2]) < 0.30:
+                    continue
+                x = int(point[0])
+                y = int(point[1])
+                cv2.circle(
+                    frame,
+                    (x, y),
+                    9,
+                    (0, 180, 255),
+                    2,
+                    cv2.LINE_AA
+                )
+                self.draw_label(
+                    frame,
+                    label + " / hand area",
+                    x + 8,
+                    max(20, y - 8)
+                )
+
 
     def draw_hand(
         self,
@@ -4271,7 +4308,8 @@ def process_frame(
         data["objects"],
         data["events"],
         data["hands"],
-        data["diagnostic"]
+        data["diagnostic"],
+        ENGINE.latest_output
     )
 
 
@@ -4287,6 +4325,15 @@ CSS = """
 }
 
 #camera_output img {
+    object-fit: contain !important;
+}
+
+#vision_output {
+    min-height: 360px;
+    margin-top: 12px;
+}
+
+#vision_output img {
     object-fit: contain !important;
 }
 
@@ -4312,7 +4359,7 @@ with gr.Blocks(
         """
 # LifeVision
 ### Real-Time Computer Vision, Body & Scene Awareness
-Version 20.0
+Version 21.0
 """
     )
 
@@ -4326,9 +4373,17 @@ Version 20.0
                 sources=["webcam"],
                 type="numpy",
                 streaming=True,
-                label="LifeVision Camera",
+                label="Live Camera",
                 elem_id="camera_output",
                 interactive=True
+            )
+
+            vision_output = gr.Image(
+                value=None,
+                type="numpy",
+                label="AI Vision — Detections, Pose & Hands",
+                elem_id="vision_output",
+                interactive=False
             )
 
         with gr.Column(
@@ -4559,7 +4614,8 @@ Version 20.0
         objects_output,
         events_output,
         hands_output,
-        diagnostic_output
+        diagnostic_output,
+        vision_output
     ]
 
     camera.stream(
