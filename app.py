@@ -11,15 +11,15 @@ try:
 except Exception:
     spaces = None
 
-import cv2
-import numpy as np
-import gradio as gr
-from ultralytics import YOLO
-
 try:
     import torch
 except Exception:
     torch = None
+
+import cv2
+import numpy as np
+import gradio as gr
+from ultralytics import YOLO
 
 try:
     import mediapipe as mp
@@ -33,7 +33,7 @@ except Exception:
     MEDIAPIPE_AVAILABLE = False
 
 
-APP_VERSION = "17.0"
+APP_VERSION = "18.0"
 
 OBJECT_MODEL = "yolo11n.pt"
 POSE_MODEL = "yolo11n-pose.pt"
@@ -264,7 +264,6 @@ class Tracker:
 
         used = set()
         output = []
-
         current_time = time.time()
 
         for det in detections:
@@ -301,7 +300,6 @@ class Tracker:
             }
 
             det["track_id"] = best_id
-
             output.append(det)
 
         self._expire()
@@ -724,6 +722,7 @@ class HandLandmarkerEngine:
         self.error = ""
         self.landmarker = None
         self.lock = threading.Lock()
+        self.recognizer = GestureRecognizer()
 
         if not MEDIAPIPE_AVAILABLE:
             self.error = (
@@ -800,16 +799,15 @@ class HandLandmarkerEngine:
                 data=rgb
             )
 
-            result = self.landmarker.detect(
-                image
-            )
+            with self.lock:
+                result = self.landmarker.detect(
+                    image
+                )
 
             hands = []
 
             if not result.hand_landmarks:
                 return hands
-
-            recognizer = GestureRecognizer()
 
             for index, landmarks in enumerate(
                 result.hand_landmarks
@@ -867,7 +865,7 @@ class HandLandmarkerEngine:
                     max(ys)
                 )
 
-                gesture = recognizer.classify(
+                gesture = self.recognizer.classify(
                     points
                 )
 
@@ -1009,16 +1007,30 @@ POSE_GPU_MODEL = YOLO(
 try:
     OBJECT_GPU_MODEL.to("cuda")
 except Exception:
-    pass
+    if (
+        torch is not None
+        and torch.cuda.is_available()
+    ):
+        try:
+            OBJECT_GPU_MODEL.to("cuda")
+        except Exception:
+            pass
 
 try:
     POSE_GPU_MODEL.to("cuda")
 except Exception:
-    pass
+    if (
+        torch is not None
+        and torch.cuda.is_available()
+    ):
+        try:
+            POSE_GPU_MODEL.to("cuda")
+        except Exception:
+            pass
 
 
 @GPU_DECORATOR(
-    duration=60
+    duration=15
 )
 def run_gpu_inference(
     frame,
@@ -1026,7 +1038,8 @@ def run_gpu_inference(
     pose_confidence,
     mode,
     groups,
-    show_pose
+    show_pose,
+    run_pose
 ):
     allowed = set()
 
@@ -1044,14 +1057,15 @@ def run_gpu_inference(
         allowed.add("person")
 
     object_output = []
+    object_error = ""
 
     try:
         object_result = OBJECT_GPU_MODEL.predict(
             source=frame,
             conf=float(object_confidence),
             iou=0.45,
-            imgsz=416,
-            max_det=40,
+            imgsz=320,
+            max_det=30,
             device="cuda",
             verbose=False
         )[0]
@@ -1109,17 +1123,17 @@ def run_gpu_inference(
                 )
 
     except Exception as exc:
-        object_output = {
-            "error": (
-                f"{type(exc).__name__}: "
-                f"{exc}"
-            )
-        }
+        object_error = (
+            f"{type(exc).__name__}: "
+            f"{exc}"
+        )
 
     pose_output = []
+    pose_error = ""
 
     if (
         show_pose
+        and run_pose
         and mode != "Object & People Awareness"
     ):
         try:
@@ -1127,8 +1141,8 @@ def run_gpu_inference(
                 source=frame,
                 conf=float(pose_confidence),
                 iou=0.45,
-                imgsz=416,
-                max_det=16,
+                imgsz=320,
+                max_det=10,
                 device="cuda",
                 verbose=False
             )[0]
@@ -1182,16 +1196,16 @@ def run_gpu_inference(
                     )
 
         except Exception as exc:
-            pose_output = {
-                "error": (
-                    f"{type(exc).__name__}: "
-                    f"{exc}"
-                )
-            }
+            pose_error = (
+                f"{type(exc).__name__}: "
+                f"{exc}"
+            )
 
     return (
         object_output,
-        pose_output
+        pose_output,
+        object_error,
+        pose_error
     )
 
 
@@ -1201,6 +1215,9 @@ class LifeVisionEngine:
 
         self.latest_output = None
         self.latest_snapshot = Snapshot()
+
+        self.latest_frame = None
+        self.latest_frame_time = 0.0
 
         self.frame_id = 0
         self.camera_frames = 0
@@ -1256,10 +1273,29 @@ class LifeVisionEngine:
         self.last_objects = []
         self.last_hands = []
 
+        self.render_objects = []
+        self.render_people = []
+        self.render_hands = []
+
+        self.render_scene = "Waiting for camera..."
+        self.render_narrative = (
+            "Start the camera to begin LifeVision."
+        )
+
         self.processing_lock = threading.Lock()
 
-        self.last_processed_frame = None
-        self.last_processed_time = 0.0
+        self.worker_condition = threading.Condition()
+        self.worker_running = True
+        self.worker_thread = threading.Thread(
+            target=self.ai_worker,
+            daemon=True
+        )
+        self.worker_thread.start()
+
+        self.last_ai_duration = 0.0
+        self.ai_cycle = 0
+
+        self.last_pose_cycle = -1
 
     def update_config(
         self,
@@ -1338,8 +1374,6 @@ class LifeVisionEngine:
             )
 
     def submit(self, frame):
-        self.camera_frames += 1
-
         if frame is None:
             return self.get_output()
 
@@ -1349,99 +1383,385 @@ class LifeVisionEngine:
         ):
             return self.get_output()
 
-        if self.mirror:
-            frame = cv2.flip(
-                frame,
-                1
+        with self.lock:
+            self.camera_frames += 1
+
+            current_frame = frame
+
+            if self.mirror:
+                current_frame = cv2.flip(
+                    current_frame,
+                    1
+                )
+
+            self.latest_frame = (
+                current_frame.copy()
             )
 
-        interval = 1.0 / max(
-            1.0,
-            self.process_fps_target
+            self.latest_frame_time = (
+                time.time()
+            )
+
+            objects = list(
+                self.render_objects
+            )
+
+            people = list(
+                self.render_people
+            )
+
+            hands = list(
+                self.render_hands
+            )
+
+            scene = self.render_scene
+            narrative = self.render_narrative
+
+            rendered = self.render(
+                current_frame,
+                objects,
+                people,
+                hands,
+                scene,
+                narrative
+            )
+
+            snapshot = self.latest_snapshot
+
+        with self.worker_condition:
+            self.worker_condition.notify()
+
+        return (
+            rendered,
+            self.format_snapshot(
+                snapshot
+            )
         )
 
-        now = time.time()
+    def ai_worker(self):
+        while self.worker_running:
+            with self.worker_condition:
+                self.worker_condition.wait(
+                    timeout=0.05
+                )
 
-        if (
-            self.latest_output is not None
-            and now - self.last_processed_time
-            < interval
-        ):
-            return (
-                self.latest_output.copy(),
-                self.format_snapshot(
-                    self.latest_snapshot
+            if not self.worker_running:
+                break
+
+            try:
+                self.run_latest_ai_cycle()
+            except Exception as exc:
+                with self.lock:
+                    self.gpu_error = (
+                        f"{type(exc).__name__}: "
+                        f"{exc}"
+                    )
+
+    def run_latest_ai_cycle(self):
+        with self.lock:
+            if self.latest_frame is None:
+                return
+
+            now = time.time()
+
+            interval = (
+                1.0 /
+                max(
+                    1.0,
+                    self.process_fps_target
                 )
             )
 
-        if not self.processing_lock.acquire(
-            blocking=False
-        ):
-            return self.get_output()
-
-        try:
-            now = time.time()
-
             if (
-                self.latest_output is not None
-                and now - self.last_processed_time
+                now - self.last_ai_time
                 < interval
             ):
-                return (
-                    self.latest_output.copy(),
-                    self.format_snapshot(
-                        self.latest_snapshot
-                    )
-                )
+                return
+
+            frame = self.latest_frame.copy()
+
+            mode = self.mode
+            object_confidence = (
+                self.object_confidence
+            )
+            pose_confidence = (
+                self.pose_confidence
+            )
+            groups = list(
+                self.groups
+            )
+            show_pose = self.show_pose
+            hand_confidence = (
+                self.hand_confidence
+            )
+            show_hands = self.show_hands
 
             self.frame_id += 1
+            current_frame_id = self.frame_id
 
-            frame_copy = frame.copy()
+            self.ai_cycle += 1
 
-            try:
-                gpu_result = run_gpu_inference(
-                    frame_copy,
-                    self.object_confidence,
-                    self.pose_confidence,
-                    self.mode,
-                    self.groups,
-                    self.show_pose
+            run_pose = (
+                show_pose
+                and mode != "Object & People Awareness"
+                and (
+                    self.ai_cycle % 2 == 1
+                    or self.last_pose_cycle < 0
                 )
-            except Exception as exc:
+            )
+
+            self.last_ai_time = now
+
+        started = time.time()
+
+        try:
+            gpu_result = run_gpu_inference(
+                frame,
+                object_confidence,
+                pose_confidence,
+                mode,
+                groups,
+                show_pose,
+                run_pose
+            )
+        except Exception as exc:
+            gpu_result = (
+                [],
+                [],
+                f"{type(exc).__name__}: {exc}",
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        processing_started = time.time()
+
+        try:
+            output, snapshot = (
+                self.process_ai_result(
+                    frame,
+                    gpu_result,
+                    current_frame_id,
+                    show_hands,
+                    hand_confidence,
+                    run_pose
+                )
+            )
+
+            duration = max(
+                0.0001,
+                time.time() - started
+            )
+
+            with self.lock:
+                self.last_ai_duration = duration
+                self.ai_times.append(
+                    duration
+                )
+
+                self.latest_snapshot = snapshot
+
+                self.render_objects = list(
+                    snapshot.objects
+                )
+
+                self.render_people = list(
+                    snapshot.people
+                )
+
+                self.render_hands = list(
+                    snapshot.hands
+                )
+
+                self.render_scene = (
+                    snapshot.scene
+                )
+
+                self.render_narrative = (
+                    snapshot.narrative
+                )
+
+                self.latest_output = output
+
+                if run_pose:
+                    self.last_pose_cycle = (
+                        self.ai_cycle
+                    )
+
+        except Exception as exc:
+            with self.lock:
                 self.gpu_error = (
                     f"{type(exc).__name__}: "
                     f"{exc}"
                 )
 
-                gpu_result = (
-                    {
-                        "error": self.gpu_error
-                    },
-                    {
-                        "error": self.gpu_error
-                    }
-                )
+    def process_ai_result(
+        self,
+        frame,
+        gpu_result,
+        current_frame_id,
+        show_hands,
+        hand_confidence,
+        run_pose
+    ):
+        if (
+            not isinstance(
+                gpu_result,
+                tuple
+            )
+            or len(gpu_result) != 4
+        ):
+            gpu_result = (
+                [],
+                [],
+                "Invalid GPU inference result.",
+                "Invalid GPU inference result."
+            )
 
-            output, snapshot = (
-                self.process_frame(
-                    frame_copy,
-                    gpu_result
+        (
+            gpu_objects,
+            gpu_pose,
+            object_error,
+            pose_error
+        ) = gpu_result
+
+        self.object_error = (
+            object_error
+            or ""
+        )
+
+        if run_pose:
+            self.pose_error = (
+                pose_error
+                or ""
+            )
+
+        objects = self.detect_objects(
+            gpu_objects
+        )
+
+        people = (
+            self.synchronize_people(
+                objects
+            )
+        )
+
+        if run_pose:
+            self.detect_pose(
+                gpu_pose,
+                people
+            )
+
+        hands = []
+
+        if (
+            show_hands
+            and self.mode
+            != "Object & People Awareness"
+        ):
+            hands = self.detect_hands(
+                frame,
+                people,
+                hand_confidence
+            )
+
+        scene = self.build_scene(
+            objects,
+            people
+        )
+
+        narrative = (
+            self.build_narrative(
+                objects,
+                people,
+                hands,
+                scene
+            )
+        )
+
+        self.update_events(
+            scene,
+            people
+        )
+
+        processing_time = max(
+            0.0001,
+            time.time()
+            -
+            self.last_ai_time
+        )
+
+        stable_ai_fps = (
+            1.0 /
+            max(
+                0.0001,
+                processing_time
+            )
+        )
+
+        if self.ai_times:
+            average_processing = (
+                sum(
+                    self.ai_times
+                )
+                /
+                len(
+                    self.ai_times
                 )
             )
 
-            self.latest_output = output
-            self.latest_snapshot = snapshot
-            self.last_processed_time = time.time()
-
-            return (
-                output.copy(),
-                self.format_snapshot(
-                    snapshot
+            stable_ai_fps = (
+                1.0 /
+                max(
+                    0.0001,
+                    average_processing
                 )
             )
 
-        finally:
-            self.processing_lock.release()
+        now = time.time()
+
+        runtime_error = ""
+
+        if self.gpu_error:
+            runtime_error = (
+                self.gpu_error
+            )
+
+        snapshot = Snapshot(
+            timestamp=now,
+            frame_id=current_frame_id,
+            objects=list(objects),
+            people=list(people),
+            hands=list(hands),
+            scene=scene,
+            narrative=narrative,
+            fps=self.calculate_camera_fps(),
+            ai_fps=stable_ai_fps,
+            hand_available=(
+                self.hand_engine.available
+            ),
+            runtime_error=runtime_error
+        )
+
+        self.last_objects = list(
+            objects
+        )
+
+        self.last_hands = list(
+            hands
+        )
+
+        output = self.render(
+            frame,
+            objects,
+            people,
+            hands,
+            scene,
+            narrative
+        )
+
+        return (
+            output,
+            snapshot
+        )
 
     def get_output(self):
         with self.lock:
@@ -1825,7 +2145,8 @@ class LifeVisionEngine:
     def detect_hands(
         self,
         frame,
-        people
+        people,
+        confidence
     ):
         if (
             not self.show_hands
@@ -1836,7 +2157,7 @@ class LifeVisionEngine:
 
         hands = self.hand_engine.detect(
             frame,
-            self.hand_confidence
+            confidence
         )
 
         if not hands:
@@ -2237,157 +2558,6 @@ class LifeVisionEngine:
                     f"{gestures}"
                 )
 
-    def process_frame(
-        self,
-        frame,
-        gpu_result
-    ):
-        started = time.time()
-
-        if (
-            not isinstance(
-                gpu_result,
-                tuple
-            )
-            or len(gpu_result) != 2
-        ):
-            gpu_result = (
-                {
-                    "error":
-                    "Invalid GPU inference result."
-                },
-                {
-                    "error":
-                    "Invalid GPU inference result."
-                }
-            )
-
-        gpu_objects, gpu_pose = (
-            gpu_result
-        )
-
-        objects = self.detect_objects(
-            gpu_objects
-        )
-
-        people = (
-            self.synchronize_people(
-                objects
-            )
-        )
-
-        self.detect_pose(
-            gpu_pose,
-            people
-        )
-
-        hands = self.detect_hands(
-            frame,
-            people
-        )
-
-        scene = self.build_scene(
-            objects,
-            people
-        )
-
-        narrative = (
-            self.build_narrative(
-                objects,
-                people,
-                hands,
-                scene
-            )
-        )
-
-        self.update_events(
-            scene,
-            people
-        )
-
-        output = self.render(
-            frame,
-            objects,
-            people,
-            hands,
-            scene,
-            narrative
-        )
-
-        processing_time = max(
-            0.0001,
-            time.time() - started
-        )
-
-        self.ai_times.append(
-            processing_time
-        )
-
-        average_processing = (
-            sum(
-                self.ai_times
-            )
-            /
-            max(
-                1,
-                len(
-                    self.ai_times
-                )
-            )
-        )
-
-        stable_ai_fps = (
-            1.0 /
-            max(
-                0.0001,
-                average_processing
-            )
-        )
-
-        now = time.time()
-
-        runtime_error = ""
-
-        if self.gpu_error:
-            runtime_error = self.gpu_error
-
-        snapshot = Snapshot(
-            timestamp=now,
-            frame_id=self.frame_id,
-            objects=objects,
-            people=people,
-            hands=hands,
-            scene=scene,
-            narrative=narrative,
-            fps=self.calculate_camera_fps(),
-            ai_fps=stable_ai_fps,
-            hand_available=(
-                self.hand_engine.available
-            ),
-            runtime_error=runtime_error
-        )
-
-        self.last_objects = objects
-        self.last_hands = hands
-
-        return (
-            output,
-            snapshot
-        )
-
-    def calculate_camera_fps(self):
-        elapsed = max(
-            0.001,
-            time.time()
-            -
-            self.camera_start
-        )
-
-        return (
-            self.camera_frames /
-            elapsed
-        )
-
     def render(
         self,
         frame,
@@ -2413,8 +2583,8 @@ class LifeVisionEngine:
 
                 cv2.rectangle(
                     output,
-                    (x1, y1),
-                    (x2, y2),
+                    (int(x1), int(y1)),
+                    (int(x2), int(y2)),
                     (255, 210, 50),
                     thickness
                 )
@@ -2433,10 +2603,10 @@ class LifeVisionEngine:
                     self.draw_label(
                         output,
                         label,
-                        x1,
+                        int(x1),
                         max(
                             20,
-                            y1 - 5
+                            int(y1) - 5
                         )
                     )
 
@@ -2623,7 +2793,7 @@ class LifeVisionEngine:
         x = max(
             3,
             min(
-                x,
+                int(x),
                 frame.shape[1]
                 -
                 size[0]
@@ -2635,7 +2805,7 @@ class LifeVisionEngine:
         y = max(
             size[1] + 8,
             min(
-                y,
+                int(y),
                 frame.shape[0]
                 -
                 4
@@ -2716,6 +2886,27 @@ class LifeVisionEngine:
             self.calculate_camera_fps()
         )
 
+        ai_fps = 0.0
+
+        if self.ai_times:
+            average = (
+                sum(
+                    self.ai_times
+                )
+                /
+                len(
+                    self.ai_times
+                )
+            )
+
+            ai_fps = (
+                1.0 /
+                max(
+                    0.0001,
+                    average
+                )
+            )
+
         line1 = (
             f"LIFEVISION  |  "
             f"{self.mode}  |  "
@@ -2726,7 +2917,8 @@ class LifeVisionEngine:
             f"People: {len(people)}  |  "
             f"Objects: {len(objects)}  |  "
             f"Hands: {len(hands)}  |  "
-            f"Camera: {fps:.1f} FPS"
+            f"Camera: {fps:.1f} FPS  |  "
+            f"AI: {ai_fps:.1f} FPS"
         )
 
         cv2.putText(
@@ -2742,7 +2934,7 @@ class LifeVisionEngine:
 
         cv2.putText(
             frame,
-            line2,
+            line2[:150],
             (14, 48),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
@@ -2764,6 +2956,19 @@ class LifeVisionEngine:
             (210, 210, 210),
             1,
             cv2.LINE_AA
+        )
+
+    def calculate_camera_fps(self):
+        elapsed = max(
+            0.001,
+            time.time()
+            -
+            self.camera_start
+        )
+
+        return (
+            self.camera_frames /
+            elapsed
         )
 
     def format_snapshot(
@@ -2943,7 +3148,17 @@ class LifeVisionEngine:
             self.events.clear()
 
     def stop(self):
-        return
+        self.worker_running = False
+
+        with self.worker_condition:
+            self.worker_condition.notify_all()
+
+        if (
+            self.worker_thread.is_alive()
+        ):
+            self.worker_thread.join(
+                timeout=1.0
+            )
 
 
 ENGINE = LifeVisionEngine()
@@ -3281,7 +3496,7 @@ with gr.Blocks(
         fn=process_frame,
         inputs=stream_inputs,
         outputs=stream_outputs,
-        stream_every=0.08,
+        stream_every=0.03,
         concurrency_limit=1
     )
 
