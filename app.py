@@ -42,10 +42,11 @@ except Exception:
     MEDIAPIPE_AVAILABLE = False
 
 
-APP_VERSION = "23.0"
+APP_VERSION = "25.0"
 
-MODE_OBJECTS = "General Awareness"
-MODE_GESTURE = "Human & Body Awareness"
+MODE_FULL = "Full Awareness"
+MODE_OBJECTS = MODE_FULL
+MODE_GESTURE = MODE_FULL
 
 OBJECT_MODEL = "yolo11n.pt"
 POSE_MODEL = "yolo11n-pose.pt"
@@ -64,6 +65,15 @@ CACHE_DIR = os.path.join(
 HAND_MODEL_PATH = os.path.join(
     CACHE_DIR,
     "hand_landmarker.task"
+)
+
+FACE_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+)
+FACE_MODEL_PATH = os.path.join(
+    CACHE_DIR,
+    "face_landmarker.task"
 )
 
 os.makedirs(
@@ -239,7 +249,18 @@ class PersonState:
     leg_state: str = "Unknown"
     hand_activity: str = "No hand activity confirmed"
     phone_status: str = "No phone interaction confirmed"
+    facial_expression: str = "Face not analyzed"
+    face_bbox: tuple = None
     body_history: deque = field(default_factory=lambda: deque(maxlen=5))
+
+
+@dataclass
+class FaceState:
+    face_id: int
+    bbox: tuple
+    expression: str
+    confidence: float
+    landmarks: list = field(default_factory=list)
 
 
 @dataclass
@@ -256,6 +277,7 @@ class Snapshot:
     objects: list = field(default_factory=list)
     people: list = field(default_factory=list)
     hands: list = field(default_factory=list)
+    faces: list = field(default_factory=list)
     scene: str = "Waiting for camera..."
     narrative: str = "Start the camera to begin LifeVision."
     fps: float = 0.0
@@ -1290,9 +1312,6 @@ def get_gpu_models():
     )
 
 
-@spaces.GPU(
-    duration=15
-)
 def run_gpu_inference(
     frame,
     object_confidence,
@@ -1331,7 +1350,7 @@ def run_gpu_inference(
             iou=0.45,
             imgsz=416,
             max_det=40,
-            device="cpu",
+            device=("cuda:0" if torch is not None and torch.cuda.is_available() else "cpu"),
             verbose=False
         )[0]
 
@@ -1491,6 +1510,94 @@ def run_gpu_inference(
     )
 
 
+class FaceLandmarkerEngine:
+    def __init__(self):
+        self.available = False
+        self.error = ""
+        self.landmarker = None
+        self.lock = threading.Lock()
+        self.initialized = False
+        self.initializing = False
+
+    def initialize(self):
+        with self.lock:
+            if self.initialized:
+                return self.available
+            if self.initializing:
+                return False
+            self.initializing = True
+        try:
+            if not MEDIAPIPE_AVAILABLE:
+                raise RuntimeError("MediaPipe is not available")
+            if not os.path.exists(FACE_MODEL_PATH):
+                temp = FACE_MODEL_PATH + ".download"
+                urllib.request.urlretrieve(FACE_MODEL_URL, temp)
+                os.replace(temp, FACE_MODEL_PATH)
+            base = python.BaseOptions(model_asset_path=FACE_MODEL_PATH)
+            options = vision.FaceLandmarkerOptions(
+                base_options=base,
+                running_mode=vision.RunningMode.IMAGE,
+                num_faces=4,
+                min_face_detection_confidence=0.25,
+                min_face_presence_confidence=0.25,
+                min_tracking_confidence=0.25,
+                output_face_blendshapes=True,
+                output_facial_transformation_matrixes=False
+            )
+            self.landmarker = vision.FaceLandmarker.create_from_options(options)
+            self.available = True
+            self.initialized = True
+            self.initializing = False
+            return True
+        except Exception as exc:
+            self.error = f"Face engine unavailable: {exc}"
+            self.initialized = True
+            self.initializing = False
+            return False
+
+    def _expression(self, blendshapes):
+        scores = {}
+        for item in blendshapes or []:
+            name = getattr(item, "category_name", "") or ""
+            score = float(getattr(item, "score", 0.0) or 0.0)
+            scores[name] = score
+        smile = (scores.get("mouthSmileLeft",0)+scores.get("mouthSmileRight",0))/2
+        frown = (scores.get("mouthFrownLeft",0)+scores.get("mouthFrownRight",0))/2
+        brow = scores.get("browInnerUp",0)
+        jaw = scores.get("jawOpen",0)
+        wide = (scores.get("eyeWideLeft",0)+scores.get("eyeWideRight",0))/2
+        squint = (scores.get("eyeSquintLeft",0)+scores.get("eyeSquintRight",0))/2
+        if smile > 0.45: return "Smiling"
+        if jaw > 0.45 and wide > 0.30: return "Surprised"
+        if frown > 0.40 and brow > 0.25: return "Sad / Concerned"
+        if brow > 0.50: return "Brows raised"
+        if squint > 0.45: return "Eyes narrowed"
+        return "Neutral / Unclear"
+
+    def detect(self, frame):
+        if not self.initialized or not self.available or self.landmarker is None:
+            return []
+        try:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb = np.ascontiguousarray(rgb)
+            image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            with self.lock:
+                result = self.landmarker.detect(image)
+            output=[]
+            for i, landmarks in enumerate(result.face_landmarks or []):
+                xs=[float(p.x) for p in landmarks]; ys=[float(p.y) for p in landmarks]
+                bbox=(max(0,min(xs)), max(0,min(ys)), min(1,max(xs)), min(1,max(ys)))
+                blend=[]
+                if result.face_blendshapes and i < len(result.face_blendshapes):
+                    blend=result.face_blendshapes[i]
+                expression=self._expression(blend)
+                output.append(FaceState(i+1,bbox,expression,1.0,[(float(p.x),float(p.y),float(p.z)) for p in landmarks]))
+            return output
+        except Exception as exc:
+            self.error=f"{type(exc).__name__}: {exc}"
+            return []
+
+
 class LifeVisionEngine:
     def __init__(self):
         self.lock = threading.RLock()
@@ -1520,7 +1627,7 @@ class LifeVisionEngine:
             maxlen=20
         )
 
-        self.mode = MODE_OBJECTS
+        self.mode = MODE_FULL
 
         self.object_confidence = 0.35
         self.pose_confidence = 0.35
@@ -1559,6 +1666,7 @@ class LifeVisionEngine:
         self.gesture = GestureRecognizer()
         self.events = EventEngine()
         self.hand_engine = HandLandmarkerEngine()
+        self.face_engine = FaceLandmarkerEngine()
 
         self.people = {}
         self.last_objects = []
@@ -1567,6 +1675,7 @@ class LifeVisionEngine:
         self.render_objects = []
         self.render_people = []
         self.render_hands = []
+        self.render_faces = []
 
         self.render_scene = (
             "Waiting for camera..."
@@ -1582,14 +1691,12 @@ class LifeVisionEngine:
             threading.Condition()
         )
 
-        self.worker_running = True
+        self.worker_running = False
 
         self.worker_thread = threading.Thread(
             target=self.ai_worker,
             daemon=True
         )
-
-        self.worker_thread.start()
 
         self.last_ai_duration = 0.0
         self.ai_cycle = 0
@@ -1621,7 +1728,7 @@ class LifeVisionEngine:
                 MODE_OBJECTS,
                 MODE_GESTURE
             }:
-                self.mode = MODE_OBJECTS
+                self.mode = MODE_FULL
 
             self.process_fps_target = max(
                 1.0,
@@ -1944,6 +2051,9 @@ class LifeVisionEngine:
                 self.render_hands = list(
                     snapshot.hands
                 )
+                self.render_faces = list(
+                    snapshot.faces
+                )
 
                 self.render_scene = (
                     snapshot.scene
@@ -2031,67 +2141,36 @@ class LifeVisionEngine:
                 people
             )
 
-        hands = []
+        hands = self.detect_hands(
+            frame,
+            people,
+            hand_confidence
+        ) if show_hands else []
 
-        if show_hands:
-            hands = self.detect_hands(
-                frame,
-                people,
-                hand_confidence
-            )
+        if not self.face_engine.initialized:
+            self.face_engine.initialize()
+        faces = self.detect_faces(frame, people)
 
-        if self.mode == MODE_GESTURE:
-            self.analyze_body_language(
-                people,
-                objects,
-                hands,
-                frame.shape[1],
-                frame.shape[0]
-            )
+        self.analyze_body_language(
+            people,
+            objects,
+            hands,
+            frame.shape[1],
+            frame.shape[0]
+        )
 
-        if self.mode == MODE_OBJECTS:
-            scene = self.build_object_scene(
-                objects,
-                people
-            )
+        scene = self.build_scene(
+            objects,
+            people,
+            hands
+        )
 
-            narrative = (
-                self.build_object_narrative(
-                    objects,
-                    people,
-                    scene
-                )
-            )
-
-        elif self.mode == MODE_GESTURE:
-            scene = self.build_body_scene(
-                people,
-                hands
-            )
-
-            narrative = (
-                self.build_body_narrative(
-                    people,
-                    hands,
-                    scene
-                )
-            )
-
-        else:
-            scene = self.build_scene(
-                objects,
-                people,
-                hands
-            )
-
-            narrative = (
-                self.build_narrative(
-                    objects,
-                    people,
-                    hands,
-                    scene
-                )
-            )
+        narrative = self.build_narrative(
+            objects,
+            people,
+            hands,
+            scene
+        )
 
         self.update_events(
             scene,
@@ -2135,6 +2214,7 @@ class LifeVisionEngine:
             objects=list(objects),
             people=list(people),
             hands=list(hands),
+            faces=list(faces),
             scene=scene,
             narrative=narrative,
             fps=self.calculate_camera_fps(),
@@ -2159,14 +2239,16 @@ class LifeVisionEngine:
             people,
             hands,
             scene,
-            narrative
+            narrative,
+            faces
         )
 
         overlay_payload = self.build_overlay_payload(
             frame,
             objects,
             people,
-            hands
+            hands,
+            faces
         )
 
         return (
@@ -2184,7 +2266,8 @@ class LifeVisionEngine:
                     self.render_people,
                     self.render_hands,
                     self.render_scene,
-                    self.render_narrative
+                    self.render_narrative,
+                    self.render_faces
                 )
             elif self.latest_output is not None:
                 output = (
@@ -2663,6 +2746,27 @@ class LifeVisionEngine:
                     )
 
         return hands
+
+    def detect_faces(self, frame, people):
+        faces = self.face_engine.detect(frame)
+        for person in people:
+            person.facial_expression = "Face not visible"
+            person.face_bbox = None
+        h,w=frame.shape[:2]
+        for face in faces:
+            cx=((face.bbox[0]+face.bbox[2])*0.5)*w
+            cy=((face.bbox[1]+face.bbox[3])*0.5)*h
+            nearest=None; best=10**9
+            for person in people:
+                x1,y1,x2,y2=person.bbox
+                px,py=person.center
+                if x1-50 <= cx <= x2+50 and y1-50 <= cy <= y2+50:
+                    d=math.hypot(cx-px,cy-py)
+                    if d<best: nearest=person; best=d
+            if nearest is not None:
+                nearest.facial_expression=face.expression
+                nearest.face_bbox=face.bbox
+        return faces
 
     def build_object_scene(
         self,
@@ -3564,7 +3668,8 @@ class LifeVisionEngine:
         frame,
         objects,
         people,
-        hands
+        hands,
+        faces=None
     ):
         height, width = frame.shape[:2]
         payload = {
@@ -3590,7 +3695,7 @@ class LifeVisionEngine:
                 if len(point) >= 3:
                     keypoints.append([float(point[0]) / max(1, width), float(point[1]) / max(1, height), float(point[2])])
             payload["people"].append({
-                "track_id": int(person.track_id),
+                "track_id": int(person.person_id),
                 "bbox": [float(x1) / max(1, width), float(y1) / max(1, height), float(x2) / max(1, width), float(y2) / max(1, height)],
                 "keypoints": keypoints
             })
@@ -3608,6 +3713,14 @@ class LifeVisionEngine:
                 "bbox": [float(x1), float(y1), float(x2), float(y2)],
                 "landmarks": landmarks
             })
+        payload["faces"] = [
+            {
+                "face_id": int(face.face_id),
+                "bbox": [float(v) for v in face.bbox],
+                "expression": str(face.expression)
+            }
+            for face in (faces or [])
+        ]
         return payload
 
     def render(
@@ -3617,7 +3730,8 @@ class LifeVisionEngine:
         people,
         hands,
         scene,
-        narrative
+        narrative,
+        faces=None
     ):
         output = frame.copy()
 
@@ -3685,6 +3799,8 @@ class LifeVisionEngine:
                     hand
                 )
 
+        for face in (faces or []):
+            self.draw_face(output, face)
 
         if self.show_hud:
             self.draw_hud(
@@ -3914,6 +4030,13 @@ class LifeVisionEngine:
             cv2.LINE_AA
         )
 
+    def draw_face(self, frame, face):
+        h,w=frame.shape[:2]
+        x1,y1,x2,y2=face.bbox
+        p1=(int(x1*w),int(y1*h)); p2=(int(x2*w),int(y2*h))
+        cv2.rectangle(frame,p1,p2,(255,120,220),2)
+        self.draw_label(frame,f"Face {face.expression}",p1[0],max(20,p1[1]-5))
+
     def draw_hud(
         self,
         frame,
@@ -4064,7 +4187,8 @@ class LifeVisionEngine:
                 f"{person.movement} | "
                 f"Body: {person.body_language} | "
                 f"Arms: {person.arm_state} | "
-                f"Legs: {person.leg_state}"
+                f"Legs: {person.leg_state} | "
+                f"Face: {person.facial_expression}"
             )
 
             if person.gestures:
@@ -4163,8 +4287,9 @@ class LifeVisionEngine:
 
         for hand in snapshot.hands:
             hand_lines.append(
-                f"{hand.handedness}: "
-                f"{hand.gesture}"
+                f"{hand.handedness}: {hand.gesture} | "
+                f"21 landmarks | 3D XYZ available | "
+                f"confidence {hand.confidence:.0%}"
             )
 
         runtime_errors = []
@@ -4195,6 +4320,13 @@ class LifeVisionEngine:
                 "Hands: "
                 +
                 self.hand_engine.error
+            )
+
+        if self.face_engine.error:
+            runtime_errors.append(
+                "Face: "
+                +
+                self.face_engine.error
             )
 
         if snapshot.runtime_error:
@@ -4247,6 +4379,14 @@ class LifeVisionEngine:
                     hand_lines
                 )
             ),
+            "faces": "\n".join(
+                f"Face {i+1}: {face.expression}"
+                for i, face in enumerate(snapshot.faces)
+            ) or "No face detected.",
+            "body": "\n".join(
+                f"Person {p.person_id}: posture={p.posture} | movement={p.movement} | arms={p.arm_state} | legs={p.leg_state} | body language={p.body_language}"
+                for p in snapshot.people
+            ) or "No body detected.",
             "diagnostic": diagnostic
         }
 
@@ -4271,9 +4411,11 @@ class LifeVisionEngine:
 ENGINE = LifeVisionEngine()
 
 
+@spaces.GPU(
+duration=30
+)
 def process_frame(
     frame,
-    mode,
     process_fps,
     object_confidence,
     pose_confidence,
@@ -4287,7 +4429,7 @@ def process_frame(
     groups
 ):
     ENGINE.update_config(
-        mode,
+        MODE_FULL,
         process_fps,
         object_confidence,
         pose_confidence,
@@ -4301,23 +4443,71 @@ def process_frame(
         groups
     )
 
-    ENGINE.submit(
-        frame
+    if frame is None:
+        data = ENGINE.format_snapshot(ENGINE.latest_snapshot)
+        return (
+            data["metrics"], data["scene"], data["narrative"],
+            data["people"], data["objects"], data["events"],
+            data["hands"], data["faces"], data["body"], data["diagnostic"],
+            json.dumps(ENGINE.latest_overlay_payload, separators=(",", ":"))
+        )
+
+    current_frame = np.ascontiguousarray(frame)
+    current_frame = cv2.cvtColor(current_frame, cv2.COLOR_RGB2BGR)
+    if mirror:
+        current_frame = cv2.flip(current_frame, 1)
+
+    with ENGINE.lock:
+        ENGINE.camera_frames += 1
+        ENGINE.latest_frame = current_frame.copy()
+        ENGINE.latest_frame_time = time.time()
+        ENGINE.frame_id += 1
+        current_frame_id = ENGINE.frame_id
+        ENGINE.ai_cycle += 1
+
+    if show_hands and not ENGINE.hand_engine.initialized:
+        ENGINE.hand_engine.initialize()
+
+    started = time.time()
+    gpu_result = run_gpu_inference(
+        current_frame,
+        float(object_confidence),
+        float(pose_confidence),
+        MODE_FULL,
+        list(groups or []),
+        bool(show_pose),
+        bool(show_pose)
     )
 
-    data = ENGINE.format_snapshot(
-        ENGINE.latest_snapshot
+    output, snapshot, overlay_payload = ENGINE.process_ai_result(
+        current_frame,
+        gpu_result,
+        current_frame_id,
+        bool(show_hands),
+        float(hand_confidence),
+        bool(show_pose)
     )
 
+    duration = max(0.0001, time.time() - started)
+    with ENGINE.lock:
+        ENGINE.last_ai_duration = duration
+        ENGINE.ai_times.append(duration)
+        ENGINE.latest_snapshot = snapshot
+        ENGINE.render_objects = list(snapshot.objects)
+        ENGINE.render_people = list(snapshot.people)
+        ENGINE.render_hands = list(snapshot.hands)
+        ENGINE.render_scene = snapshot.scene
+        ENGINE.render_narrative = snapshot.narrative
+        ENGINE.latest_output = output
+        ENGINE.latest_overlay_payload = overlay_payload
+        ENGINE.last_ai_time = time.time()
+        ENGINE.gpu_error = ""
+
+    data = ENGINE.format_snapshot(snapshot)
     return (
-        data["metrics"],
-        data["scene"],
-        data["narrative"],
-        data["people"],
-        data["objects"],
-        data["events"],
-        data["hands"],
-        data["diagnostic"],
+        data["metrics"], data["scene"], data["narrative"],
+        data["people"], data["objects"], data["events"],
+        data["hands"], data["diagnostic"],
         json.dumps(ENGINE.latest_overlay_payload, separators=(",", ":"))
     )
 
@@ -4365,6 +4555,23 @@ CSS = """
 .status-title {
     font-weight: 700;
 }
+
+.gradio-container {
+    max-width: 1500px !important;
+}
+
+#camera_output, .metric-box, .narrative-box {
+    border-radius: 14px !important;
+}
+
+#camera_output {
+    border: 1px solid rgba(128,128,128,0.35) !important;
+    overflow: hidden !important;
+}
+
+.gradio-textbox {
+    border-radius: 12px !important;
+}
 """
 
 
@@ -4376,7 +4583,7 @@ with gr.Blocks(
         """
 # LifeVision
 ### Real-Time Computer Vision, Body & Scene Awareness
-Version 23.0
+Version 25.0
 """
     )
 
@@ -4396,7 +4603,7 @@ Version 23.0
             )
 
             overlay_data = gr.Textbox(
-                value=json.dumps({"width": 640, "height": 480, "mirror": False, "objects": [], "people": [], "hands": []}, separators=(",", ":")),
+                value=json.dumps({"width": 640, "height": 480, "mirror": False, "objects": [], "people": [], "hands": [], "faces": []}, separators=(",", ":")),
                 elem_id="overlay_data",
                 visible=False,
                 interactive=False
@@ -4449,14 +4656,7 @@ Version 23.0
 
         with gr.Row():
 
-            mode = gr.Radio(
-                choices=[
-                    MODE_OBJECTS,
-                    MODE_GESTURE
-                ],
-                value=MODE_OBJECTS,
-                label="Mode"
-            )
+            gr.Markdown("**Mode: Full Awareness** — Objects + People + Hands + Pose + Legs + Body Language + Face/Expression")
 
             process_fps = gr.Slider(
                 minimum=1,
@@ -4565,6 +4765,24 @@ Version 23.0
     with gr.Row():
 
         with gr.Column():
+            face_output = gr.Textbox(
+                label="Facial Expression",
+                value="No face analyzed yet.",
+                lines=6,
+                interactive=False
+            )
+
+        with gr.Column():
+            body_output = gr.Textbox(
+                label="Body Language / Posture / Legs",
+                value="No body detected yet.",
+                lines=6,
+                interactive=False
+            )
+
+    with gr.Row():
+
+        with gr.Column():
 
             events_output = gr.Textbox(
                 label="Event Log",
@@ -4609,7 +4827,6 @@ Version 23.0
 
     stream_inputs = [
         camera,
-        mode,
         process_fps,
         object_confidence,
         pose_confidence,
@@ -4631,6 +4848,8 @@ Version 23.0
         objects_output,
         events_output,
         hands_output,
+        face_output,
+        body_output,
         diagnostic_output,
         overlay_data
     ]
@@ -4639,9 +4858,9 @@ Version 23.0
         fn=process_frame,
         inputs=stream_inputs,
         outputs=stream_outputs,
-        stream_every=0.10,
+        stream_every=0.25,
         concurrency_limit=1,
-        queue=False,
+        queue=True,
         show_progress="hidden"
     )
 
@@ -4707,6 +4926,7 @@ OVERLAY_JS = r"""
         for(const o of (d.objects||[])){const id=o.track_id>0?` - P${o.track_id}`:"";box(c,o.bbox,w,h,`${o.label} ${Math.round(o.confidence*100)}%${id}`);}
         pose(c,d.people,w,h);
         hands(c,d.hands,w,h);
+        for(const f of (d.faces||[])){box(c,f.bbox,w,h,`Face - ${f.expression}`);}
     }
     function read(){
         const t=document.querySelector("#overlay_data textarea");if(!t)return;
