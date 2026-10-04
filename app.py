@@ -3,6 +3,7 @@ import time
 import math
 import threading
 import urllib.request
+import json
 from dataclasses import dataclass, field
 from collections import deque, Counter
 
@@ -33,7 +34,7 @@ except Exception:
     MEDIAPIPE_AVAILABLE = False
 
 
-APP_VERSION = "21.0"
+APP_VERSION = "22.0"
 
 MODE_OBJECTS = "General Awareness"
 MODE_GESTURE = "Human & Body Awareness"
@@ -1018,7 +1019,11 @@ class HandLandmarkerEngine:
                 (target_width, target_height),
                 interpolation=cv2.INTER_LINEAR
             )
-            rgb = np.ascontiguousarray(enlarged)
+            rgb = cv2.cvtColor(
+                enlarged,
+                cv2.COLOR_BGR2RGB
+            )
+            rgb = np.ascontiguousarray(rgb)
 
             image = mp.Image(
                 image_format=(
@@ -1508,6 +1513,14 @@ class LifeVisionEngine:
         self.lock = threading.RLock()
 
         self.latest_output = None
+        self.latest_overlay_payload = {
+            "width": 640,
+            "height": 480,
+            "mirror": False,
+            "objects": [],
+            "people": [],
+            "hands": []
+        }
         self.latest_snapshot = Snapshot()
 
         self.latest_frame = None
@@ -1914,7 +1927,7 @@ class LifeVisionEngine:
             )
 
         try:
-            output, snapshot = (
+            output, snapshot, overlay_payload = (
                 self.process_ai_result(
                     frame,
                     gpu_result,
@@ -1966,6 +1979,8 @@ class LifeVisionEngine:
                 self.latest_output = (
                     output
                 )
+
+                self.latest_overlay_payload = overlay_payload
 
                 if run_pose:
                     self.last_pose_cycle = (
@@ -2174,9 +2189,17 @@ class LifeVisionEngine:
             narrative
         )
 
+        overlay_payload = self.build_overlay_payload(
+            frame,
+            objects,
+            people,
+            hands
+        )
+
         return (
             output,
-            snapshot
+            snapshot,
+            overlay_payload
         )
 
     def get_output(self):
@@ -3565,6 +3588,57 @@ class LifeVisionEngine:
                     )
                 )
 
+    def build_overlay_payload(
+        self,
+        frame,
+        objects,
+        people,
+        hands
+    ):
+        height, width = frame.shape[:2]
+        payload = {
+            "width": int(width),
+            "height": int(height),
+            "mirror": bool(self.mirror),
+            "objects": [],
+            "people": [],
+            "hands": []
+        }
+        for obj in objects:
+            x1, y1, x2, y2 = obj.bbox
+            payload["objects"].append({
+                "label": obj.label,
+                "confidence": float(obj.confidence),
+                "track_id": int(obj.track_id),
+                "bbox": [float(x1) / max(1, width), float(y1) / max(1, height), float(x2) / max(1, width), float(y2) / max(1, height)]
+            })
+        for person in people:
+            x1, y1, x2, y2 = person.bbox
+            keypoints = []
+            for point in person.keypoints or []:
+                if len(point) >= 3:
+                    keypoints.append([float(point[0]) / max(1, width), float(point[1]) / max(1, height), float(point[2])])
+            payload["people"].append({
+                "track_id": int(person.track_id),
+                "bbox": [float(x1) / max(1, width), float(y1) / max(1, height), float(x2) / max(1, width), float(y2) / max(1, height)],
+                "keypoints": keypoints
+            })
+        for hand in hands:
+            landmarks = []
+            for point in hand.landmarks:
+                if len(point) >= 3:
+                    landmarks.append([float(point[0]), float(point[1]), float(point[2])])
+            x1, y1, x2, y2 = hand.bbox
+            payload["hands"].append({
+                "hand_id": int(hand.hand_id),
+                "handedness": str(hand.handedness),
+                "confidence": float(hand.confidence),
+                "gesture": str(hand.gesture),
+                "bbox": [float(x1), float(y1), float(x2), float(y2)],
+                "landmarks": landmarks
+            })
+        return payload
+
     def render(
         self,
         frame,
@@ -3640,11 +3714,6 @@ class LifeVisionEngine:
                     hand
                 )
 
-            if not hands and people:
-                self.draw_wrist_fallback(
-                    output,
-                    people
-                )
 
         if self.show_hud:
             self.draw_hud(
@@ -3717,37 +3786,6 @@ class LifeVisionEngine:
                 -1,
                 cv2.LINE_AA
             )
-
-    def draw_wrist_fallback(
-        self,
-        frame,
-        people
-    ):
-        for person in people:
-            keypoints = person.keypoints or []
-            for index, label in ((9, "L wrist"), (10, "R wrist")):
-                if index >= len(keypoints):
-                    continue
-                point = keypoints[index]
-                if len(point) < 3 or float(point[2]) < 0.30:
-                    continue
-                x = int(point[0])
-                y = int(point[1])
-                cv2.circle(
-                    frame,
-                    (x, y),
-                    9,
-                    (0, 180, 255),
-                    2,
-                    cv2.LINE_AA
-                )
-                self.draw_label(
-                    frame,
-                    label + " / hand area",
-                    x + 8,
-                    max(20, y - 8)
-                )
-
 
     def draw_hand(
         self,
@@ -4309,7 +4347,7 @@ def process_frame(
         data["events"],
         data["hands"],
         data["diagnostic"],
-        ENGINE.latest_output
+        json.dumps(ENGINE.latest_overlay_payload, separators=(",", ":"))
     )
 
 
@@ -4328,13 +4366,21 @@ CSS = """
     object-fit: contain !important;
 }
 
-#vision_output {
-    min-height: 360px;
-    margin-top: 12px;
+#camera_output {
+    position: relative !important;
 }
 
-#vision_output img {
-    object-fit: contain !important;
+#camera_output > div {
+    position: relative !important;
+}
+
+#camera_overlay_canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 20;
+    pointer-events: none;
 }
 
 .metric-box textarea {
@@ -4359,7 +4405,7 @@ with gr.Blocks(
         """
 # LifeVision
 ### Real-Time Computer Vision, Body & Scene Awareness
-Version 21.0
+Version 22.0
 """
     )
 
@@ -4378,13 +4424,13 @@ Version 21.0
                 interactive=True
             )
 
-            vision_output = gr.Image(
-                value=None,
-                type="numpy",
-                label="AI Vision — Detections, Pose & Hands",
-                elem_id="vision_output",
+            overlay_data = gr.Textbox(
+                value=json.dumps({"width": 640, "height": 480, "mirror": False, "objects": [], "people": [], "hands": []}, separators=(",", ":")),
+                elem_id="overlay_data",
+                visible=False,
                 interactive=False
             )
+
 
         with gr.Column(
             scale=3,
@@ -4615,7 +4661,7 @@ Version 21.0
         events_output,
         hands_output,
         diagnostic_output,
-        vision_output
+        overlay_data
     ]
 
     camera.stream(
@@ -4629,11 +4675,88 @@ Version 21.0
     )
 
 
+OVERLAY_JS = r"""
+(() => {
+    const state = { canvas: null, ctx: null, data: null, timer: null };
+    function video() { return document.querySelector("#camera_output video"); }
+    function ensure() {
+        const root = document.querySelector("#camera_output");
+        const v = video();
+        if (!root || !v) return false;
+        if (!state.canvas || !state.canvas.isConnected) {
+            state.canvas = document.createElement("canvas");
+            state.canvas.id = "camera_overlay_canvas";
+            root.appendChild(state.canvas);
+            state.ctx = state.canvas.getContext("2d");
+        }
+        const w = v.videoWidth || 640, h = v.videoHeight || 480;
+        state.canvas.width = w;
+        state.canvas.height = h;
+        state.canvas.style.width = `${v.clientWidth || w}px`;
+        state.canvas.style.height = `${v.clientHeight || h}px`;
+        state.canvas.style.left = `${v.offsetLeft || 0}px`;
+        state.canvas.style.top = `${v.offsetTop || 0}px`;
+        return true;
+    }
+    function label(ctx, s, x, y, size = 15) {
+        ctx.font = `700 ${size}px Arial`;
+        const m = ctx.measureText(s);
+        ctx.fillStyle = "rgba(0,0,0,0.75)";
+        ctx.fillRect(x - 4, y - size - 5, m.width + 8, size + 9);
+        ctx.fillStyle = "#fff";
+        ctx.fillText(s, x, y);
+    }
+    function box(ctx, b, w, h, s) {
+        const x1=b[0]*w,y1=b[1]*h,x2=b[2]*w,y2=b[3]*h;
+        ctx.strokeStyle="#00ff66";ctx.lineWidth=3;ctx.strokeRect(x1,y1,x2-x1,y2-y1);
+        label(ctx,s,x1,Math.max(22,y1-6));
+    }
+    function pose(ctx, people, w, h) {
+        const c=[[5,7],[7,9],[6,8],[8,10],[5,6],[5,11],[6,12],[11,12],[11,13],[13,15],[12,14],[14,16],[0,5],[0,6]];
+        for(const person of (people||[])){
+            const p=person.keypoints||[];ctx.strokeStyle="#32dc78";ctx.lineWidth=3;
+            for(const [a,b] of c){if(!p[a]||!p[b]||p[a][2]<0.35||p[b][2]<0.35)continue;ctx.beginPath();ctx.moveTo(p[a][0]*w,p[a][1]*h);ctx.lineTo(p[b][0]*w,p[b][1]*h);ctx.stroke();}
+            for(const q of p){if(!q||q[2]<0.35)continue;ctx.fillStyle="#ffe050";ctx.beginPath();ctx.arc(q[0]*w,q[1]*h,4,0,Math.PI*2);ctx.fill();}
+        }
+    }
+    function hands(ctx,list,w,h) {
+        const c=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[0,17],[17,18],[18,19],[19,20],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[13,17]];
+        for(const hand of (list||[])){
+            const p=hand.landmarks||[];if(p.length!==21)continue;
+            ctx.strokeStyle="#ff3bd4";ctx.lineWidth=3;
+            for(const [a,b] of c){ctx.beginPath();ctx.moveTo(p[a][0]*w,p[a][1]*h);ctx.lineTo(p[b][0]*w,p[b][1]*h);ctx.stroke();}
+            for(let i=0;i<21;i++){ctx.fillStyle=i===0?"#fff":"#ff3bd4";ctx.beginPath();ctx.arc(p[i][0]*w,p[i][1]*h,5,0,Math.PI*2);ctx.fill();ctx.fillStyle="#fff";ctx.font="600 10px Arial";ctx.fillText(String(i),p[i][0]*w+6,p[i][1]*h-5);}
+            box(ctx,hand.bbox,w,h,`${hand.handedness} hand - ${hand.gesture} - 21 points`);
+        }
+    }
+    function draw(){
+        if(!ensure()||!state.ctx)return;
+        const c=state.ctx,w=state.canvas.width,h=state.canvas.height;c.clearRect(0,0,w,h);
+        const d=state.data;if(!d)return;
+        for(const o of (d.objects||[])){const id=o.track_id>0?` - P${o.track_id}`:"";box(c,o.bbox,w,h,`${o.label} ${Math.round(o.confidence*100)}%${id}`);}
+        pose(c,d.people,w,h);
+        hands(c,d.hands,w,h);
+    }
+    function read(){
+        const t=document.querySelector("#overlay_data textarea");if(!t)return;
+        try{state.data=JSON.parse(t.value||"{}");draw();}catch(e){}
+    }
+    function boot(){
+        read();draw();
+        if(state.timer)return;
+        state.timer=setInterval(()=>{read();draw();},120);
+    }
+    setTimeout(boot,1000);
+    window.addEventListener("resize",draw);
+})();
+"""
+
 if __name__ == "__main__":
     demo.launch(
         server_name="0.0.0.0",
         server_port=7860,
         show_error=True,
         theme=gr.themes.Soft(),
-        css=CSS
+        css=CSS,
+        js=OVERLAY_JS
     )
