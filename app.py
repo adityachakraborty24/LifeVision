@@ -906,6 +906,16 @@ class PostureAnalyzer:
         return "Unknown"
 
 
+def _format_mediapipe_engine_error(engine_name, error):
+    message = f"{engine_name} engine unavailable: {error}"
+    if "libEGL.so.1" in str(error):
+        message += (
+            ". Add `libegl1` to the root `packages.txt`, "
+            "push the change to Hugging Face, and rebuild the Space."
+        )
+    return message
+
+
 class HandLandmarkerEngine:
     def __init__(self):
         self.available = False
@@ -945,8 +955,9 @@ class HandLandmarkerEngine:
 
         except Exception as exc:
             with self.lock:
-                self.error = (
-                    f"Hand engine unavailable: {exc}"
+                self.error = _format_mediapipe_engine_error(
+                    "Hand",
+                    exc
                 )
                 self.initialized = True
                 self.initializing = False
@@ -1492,7 +1503,10 @@ class FaceLandmarkerEngine:
             self.initializing = False
             return True
         except Exception as exc:
-            self.error = f"Face engine unavailable: {exc}"
+            self.error = _format_mediapipe_engine_error(
+                "Face",
+                exc
+            )
             self.initialized = True
             self.initializing = False
             return False
