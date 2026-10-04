@@ -1,6 +1,10 @@
 import os
 import time
 import math
+import ctypes
+import shutil
+import subprocess
+import sys
 import threading
 import urllib.request
 import json
@@ -8,6 +12,84 @@ from dataclasses import dataclass, field
 from collections import deque, Counter
 
 import spaces
+
+
+def _ensure_linux_vision_libraries():
+    if not sys.platform.startswith("linux"):
+        return ""
+
+    try:
+        ctypes.CDLL("libEGL.so.1")
+        return ""
+    except OSError:
+        pass
+
+    apt_get = shutil.which("apt-get")
+    if apt_get is None:
+        return (
+            "libEGL.so.1 is missing and apt-get is unavailable; "
+            "install libegl1 in the Space image."
+        )
+
+    if os.geteuid() != 0:
+        return (
+            "libEGL.so.1 is missing and this process is not root; "
+            "install libegl1 in the Space image."
+        )
+
+    packages = [
+        "libegl1",
+        "libgles2",
+        "libgl1",
+        "libglib2.0-0",
+        "libx11-6",
+        "libxext6",
+        "libxrender1",
+        "libsm6",
+        "libxfixes3",
+    ]
+    environment = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
+
+    try:
+        subprocess.run(
+            [apt_get, "update"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+            env=environment,
+        )
+        subprocess.run(
+            [
+                apt_get,
+                "install",
+                "--yes",
+                "--no-install-recommends",
+                *packages,
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+            env=environment,
+        )
+        ctypes.CDLL("libEGL.so.1")
+        return ""
+    except (OSError, subprocess.SubprocessError) as exc:
+        output = getattr(exc, "stdout", None) or ""
+        detail = output[-1500:].strip()
+        if detail:
+            detail = f" Installer output: {detail}"
+        return (
+            f"Automatic installation of Linux vision libraries failed: "
+            f"{exc}.{detail} Install libegl1 in the Space image."
+        )
+
+
+SYSTEM_LIBRARY_SETUP_ERROR = _ensure_linux_vision_libraries()
+
 
 try:
     import torch
@@ -24,11 +106,13 @@ try:
     from mediapipe.tasks import python
     from mediapipe.tasks.python import vision
     MEDIAPIPE_AVAILABLE = True
-except Exception:
+    MEDIAPIPE_IMPORT_ERROR = ""
+except Exception as exc:
     mp = None
     python = None
     vision = None
     MEDIAPIPE_AVAILABLE = False
+    MEDIAPIPE_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
 
 APP_VERSION = "26.0"
@@ -908,11 +992,14 @@ class PostureAnalyzer:
 
 def _format_mediapipe_engine_error(engine_name, error):
     message = f"{engine_name} engine unavailable: {error}"
+    if SYSTEM_LIBRARY_SETUP_ERROR:
+        message += f" {SYSTEM_LIBRARY_SETUP_ERROR}"
+    if MEDIAPIPE_IMPORT_ERROR and not MEDIAPIPE_AVAILABLE:
+        message += f" MediaPipe import error: {MEDIAPIPE_IMPORT_ERROR}"
     if "libEGL.so.1" in str(error):
-        message += (
-            ". Add `libegl1` to the root `packages.txt`, "
-            "push the change to Hugging Face, and rebuild the Space."
-        )
+        if not SYSTEM_LIBRARY_SETUP_ERROR:
+            message += " The automatic library check did not resolve EGL."
+        message += " Ensure the Space build includes libegl1 in packages.txt."
     return message
 
 
@@ -928,8 +1015,11 @@ class HandLandmarkerEngine:
         self.initializing = False
 
         if not MEDIAPIPE_AVAILABLE:
-            self.error = (
-                "MediaPipe is not available."
+            self.error = _format_mediapipe_engine_error(
+                "Hand",
+                RuntimeError(
+                    MEDIAPIPE_IMPORT_ERROR or "MediaPipe is not available."
+                )
             )
             self.initialized = True
 
@@ -1481,7 +1571,9 @@ class FaceLandmarkerEngine:
             self.initializing = True
         try:
             if not MEDIAPIPE_AVAILABLE:
-                raise RuntimeError("MediaPipe is not available")
+                raise RuntimeError(
+                    MEDIAPIPE_IMPORT_ERROR or "MediaPipe is not available"
+                )
             if not os.path.exists(FACE_MODEL_PATH):
                 temp = FACE_MODEL_PATH + ".download"
                 urllib.request.urlretrieve(FACE_MODEL_URL, temp)
