@@ -33,7 +33,7 @@ except Exception:
     MEDIAPIPE_AVAILABLE = False
 
 
-APP_VERSION = "19.0"
+APP_VERSION = "18.0"
 
 OBJECT_MODEL = "yolo11n.pt"
 POSE_MODEL = "yolo11n-pose.pt"
@@ -1030,7 +1030,7 @@ except Exception:
 
 
 @GPU_DECORATOR(
-    duration=8
+    duration=15
 )
 def run_gpu_inference(
     frame,
@@ -1218,8 +1218,6 @@ class LifeVisionEngine:
 
         self.latest_frame = None
         self.latest_frame_time = 0.0
-        self.latest_frame_sequence = 0
-        self.processed_frame_sequence = 0
 
         self.frame_id = 0
         self.camera_frames = 0
@@ -1228,9 +1226,6 @@ class LifeVisionEngine:
         self.process_fps_target = 4.0
         self.last_ai_time = 0.0
         self.ai_times = deque(
-            maxlen=20
-        )
-        self.ai_timestamps = deque(
             maxlen=20
         )
 
@@ -1287,6 +1282,8 @@ class LifeVisionEngine:
             "Start the camera to begin LifeVision."
         )
 
+        self.processing_lock = threading.Lock()
+
         self.worker_condition = threading.Condition()
         self.worker_running = True
 
@@ -1299,7 +1296,10 @@ class LifeVisionEngine:
 
         self.last_ai_duration = 0.0
         self.ai_cycle = 0
+
         self.last_pose_cycle = -1
+
+        self.first_frame_received = False
 
     def update_config(
         self,
@@ -1387,10 +1387,23 @@ class LifeVisionEngine:
         ):
             return self.get_output()
 
+        if frame.ndim != 3:
+            return self.get_output()
+
+        if frame.shape[2] != 3:
+            return self.get_output()
+
         with self.lock:
             self.camera_frames += 1
 
-            current_frame = frame
+            current_frame = np.ascontiguousarray(
+                frame
+            )
+
+            current_frame = cv2.cvtColor(
+                current_frame,
+                cv2.COLOR_RGB2BGR
+            )
 
             if self.mirror:
                 current_frame = cv2.flip(
@@ -1406,7 +1419,9 @@ class LifeVisionEngine:
                 time.time()
             )
 
-            self.latest_frame_sequence += 1
+            if not self.first_frame_received:
+                self.first_frame_received = True
+                self.last_ai_time = 0.0
 
             objects = list(
                 self.render_objects
@@ -1448,16 +1463,63 @@ class LifeVisionEngine:
 
     def ai_worker(self):
         while self.worker_running:
-            with self.worker_condition:
-                self.worker_condition.wait(
-                    timeout=0.05
+            try:
+                with self.lock:
+                    has_frame = (
+                        self.latest_frame
+                        is not None
+                    )
+
+                    target_fps = (
+                        self.process_fps_target
+                    )
+
+                    last_ai_time = (
+                        self.last_ai_time
+                    )
+
+                if not has_frame:
+                    with self.worker_condition:
+                        self.worker_condition.wait(
+                            timeout=0.05
+                        )
+                    continue
+
+                interval = (
+                    1.0 /
+                    max(
+                        1.0,
+                        target_fps
+                    )
                 )
 
-            if not self.worker_running:
-                break
+                now = time.time()
 
-            try:
+                wait_time = (
+                    interval
+                    -
+                    (
+                        now
+                        -
+                        last_ai_time
+                    )
+                )
+
+                if last_ai_time <= 0:
+                    wait_time = 0.0
+
+                if wait_time > 0:
+                    with self.worker_condition:
+                        self.worker_condition.wait(
+                            timeout=min(
+                                wait_time,
+                                0.025
+                            )
+                        )
+                    continue
+
                 self.run_latest_ai_cycle()
+
             except Exception as exc:
                 with self.lock:
                     self.gpu_error = (
@@ -1465,16 +1527,14 @@ class LifeVisionEngine:
                         f"{exc}"
                     )
 
+                time.sleep(0.05)
+
     def run_latest_ai_cycle(self):
         with self.lock:
             if self.latest_frame is None:
                 return
 
-            if (
-                self.latest_frame_sequence
-                <= self.processed_frame_sequence
-            ):
-                return
+            frame = self.latest_frame.copy()
 
             now = time.time()
 
@@ -1487,16 +1547,12 @@ class LifeVisionEngine:
             )
 
             if (
+                self.last_ai_time > 0
+                and
                 now - self.last_ai_time
                 < interval
             ):
                 return
-
-            frame = self.latest_frame.copy()
-
-            frame_sequence = (
-                self.latest_frame_sequence
-            )
 
             mode = self.mode
 
@@ -1538,9 +1594,6 @@ class LifeVisionEngine:
             )
 
             self.last_ai_time = now
-            self.processed_frame_sequence = (
-                frame_sequence
-            )
 
         started = time.time()
 
@@ -1586,10 +1639,6 @@ class LifeVisionEngine:
                     duration
                 )
 
-                self.ai_timestamps.append(
-                    time.time()
-                )
-
                 self.latest_snapshot = (
                     snapshot
                 )
@@ -1618,12 +1667,12 @@ class LifeVisionEngine:
                     output
                 )
 
-                self.gpu_error = ""
-
                 if run_pose:
                     self.last_pose_cycle = (
                         self.ai_cycle
                     )
+
+                self.gpu_error = ""
 
         except Exception as exc:
             with self.lock:
@@ -1721,20 +1770,35 @@ class LifeVisionEngine:
             people
         )
 
-        with self.lock:
-            ai_fps = self.calculate_ai_fps()
-            camera_fps = (
-                self.calculate_camera_fps()
+        if self.ai_times:
+            average_processing = (
+                sum(
+                    self.ai_times
+                )
+                /
+                len(
+                    self.ai_times
+                )
             )
 
-            runtime_error = ""
-
-            if self.gpu_error:
-                runtime_error = (
-                    self.gpu_error
+            stable_ai_fps = (
+                1.0 /
+                max(
+                    0.0001,
+                    average_processing
                 )
+            )
+        else:
+            stable_ai_fps = 0.0
 
         now = time.time()
+
+        runtime_error = ""
+
+        if self.gpu_error:
+            runtime_error = (
+                self.gpu_error
+            )
 
         snapshot = Snapshot(
             timestamp=now,
@@ -1744,8 +1808,8 @@ class LifeVisionEngine:
             hands=list(hands),
             scene=scene,
             narrative=narrative,
-            fps=camera_fps,
-            ai_fps=ai_fps,
+            fps=self.calculate_camera_fps(),
+            ai_fps=stable_ai_fps,
             hand_available=(
                 self.hand_engine.available
             ),
@@ -1774,32 +1838,22 @@ class LifeVisionEngine:
             snapshot
         )
 
-    def calculate_ai_fps(self):
-        if len(
-            self.ai_timestamps
-        ) < 2:
-            return 0.0
-
-        timestamps = list(
-            self.ai_timestamps
-        )
-
-        elapsed = (
-            timestamps[-1]
-            -
-            timestamps[0]
-        )
-
-        if elapsed <= 0:
-            return 0.0
-
-        return (
-            len(timestamps) - 1
-        ) / elapsed
-
     def get_output(self):
         with self.lock:
-            if self.latest_output is None:
+            if self.latest_frame is not None:
+                output = self.render(
+                    self.latest_frame,
+                    self.render_objects,
+                    self.render_people,
+                    self.render_hands,
+                    self.render_scene,
+                    self.render_narrative
+                )
+            elif self.latest_output is not None:
+                output = (
+                    self.latest_output.copy()
+                )
+            else:
                 output = np.zeros(
                     (
                         480,
@@ -1818,10 +1872,6 @@ class LifeVisionEngine:
                     (255, 255, 255),
                     2,
                     cv2.LINE_AA
-                )
-            else:
-                output = (
-                    self.latest_output.copy()
                 )
 
             return (
@@ -2920,9 +2970,26 @@ class LifeVisionEngine:
             self.calculate_camera_fps()
         )
 
-        ai_fps = (
-            self.calculate_ai_fps()
-        )
+        ai_fps = 0.0
+
+        if self.ai_times:
+            average = (
+                sum(
+                    self.ai_times
+                )
+                /
+                len(
+                    self.ai_times
+                )
+            )
+
+            ai_fps = (
+                1.0 /
+                max(
+                    0.0001,
+                    average
+                )
+            )
 
         line1 = (
             f"LIFEVISION  |  "
@@ -3235,10 +3302,6 @@ def clear_event_log():
 
 
 CSS = """
-#camera_input {
-    min-height: 1px;
-}
-
 #camera_output {
     min-height: 560px;
 }
@@ -3278,18 +3341,11 @@ with gr.Blocks(
             scale=7,
             min_width=600
         ):
-
             camera = gr.Image(
                 sources=["webcam"],
                 type="numpy",
                 streaming=True,
                 label="LifeVision Camera",
-                elem_id="camera_input"
-            )
-
-            camera_output = gr.Image(
-                type="numpy",
-                label="LiveVision Output",
                 elem_id="camera_output"
             )
 
@@ -3509,7 +3565,7 @@ with gr.Blocks(
     ]
 
     stream_outputs = [
-        camera_output,
+        camera,
         metrics,
         scene,
         narrative,
@@ -3524,7 +3580,7 @@ with gr.Blocks(
         fn=process_frame,
         inputs=stream_inputs,
         outputs=stream_outputs,
-        stream_every=0.04,
+        stream_every=0.03,
         concurrency_limit=1
     )
 
