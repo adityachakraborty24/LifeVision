@@ -10,7 +10,15 @@ from collections import deque, Counter
 try:
     import spaces
 except Exception:
-    spaces = None
+    class _LocalSpaces:
+        @staticmethod
+        def GPU(function=None, **kwargs):
+            if function is None:
+                def wrapper(fn):
+                    return fn
+                return wrapper
+            return function
+    spaces = _LocalSpaces()
 
 try:
     import torch
@@ -1237,17 +1245,6 @@ class EventEngine:
         return "\n".join(lines)
 
 
-def _identity_decorator(function=None, **kwargs):
-    if function is None:
-        def wrapper(fn):
-            return fn
-        return wrapper
-
-    return function
-
-
-GPU_DECORATOR = _identity_decorator
-
 OBJECT_GPU_MODEL = None
 POSE_GPU_MODEL = None
 MODEL_LOCK = threading.Lock()
@@ -1266,14 +1263,20 @@ def get_gpu_models():
                     OBJECT_MODEL
                 )
 
-                OBJECT_GPU_MODEL.to("cpu")
+                if torch is not None and torch.cuda.is_available():
+                    OBJECT_GPU_MODEL.to("cuda")
+                else:
+                    OBJECT_GPU_MODEL.to("cpu")
 
             if POSE_GPU_MODEL is None:
                 POSE_GPU_MODEL = YOLO(
                     POSE_MODEL
                 )
 
-                POSE_GPU_MODEL.to("cpu")
+                if torch is not None and torch.cuda.is_available():
+                    POSE_GPU_MODEL.to("cuda")
+                else:
+                    POSE_GPU_MODEL.to("cpu")
 
         except Exception as exc:
             MODEL_ERROR = (
@@ -1287,7 +1290,7 @@ def get_gpu_models():
     )
 
 
-@GPU_DECORATOR(
+@spaces.GPU(
     duration=15
 )
 def run_gpu_inference(
