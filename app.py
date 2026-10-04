@@ -42,7 +42,7 @@ except Exception:
     MEDIAPIPE_AVAILABLE = False
 
 
-APP_VERSION = "25.1"
+APP_VERSION = "26.0"
 
 MODE_FULL = "Full Awareness"
 MODE_OBJECTS = MODE_FULL
@@ -1011,9 +1011,9 @@ class HandLandmarkerEngine:
                     vision.RunningMode.IMAGE
                 ),
                 num_hands=2,
-                min_hand_detection_confidence=0.25,
-                min_hand_presence_confidence=0.25,
-                min_tracking_confidence=0.25
+                min_hand_detection_confidence=0.15,
+                min_hand_presence_confidence=0.15,
+                min_tracking_confidence=0.15
             )
         )
 
@@ -1025,174 +1025,127 @@ class HandLandmarkerEngine:
 
         self.available = True
 
-    def detect(
-        self,
-        frame,
-        confidence=0.45
-    ):
-        if (
-            not self.initialized
-            or
-            not self.available
-            or
-            self.landmarker is None
-        ):
+    def _detect_image(self, image_bgr):
+        if self.landmarker is None:
             return []
+        rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        rgb = np.ascontiguousarray(rgb)
+        image = mp.Image(
+            image_format=mp.ImageFormat.SRGB,
+            data=rgb
+        )
+        with self.lock:
+            result = self.landmarker.detect(image)
+        detected = []
+        if not result.hand_landmarks:
+            return detected
+        for index, landmarks in enumerate(result.hand_landmarks):
+            points = [
+                (float(point.x), float(point.y), float(point.z))
+                for point in landmarks
+            ]
+            handedness = "Unknown"
+            handedness_score = 1.0
+            if result.handedness and index < len(result.handedness) and result.handedness[index]:
+                item = result.handedness[index][0]
+                handedness = item.category_name or "Unknown"
+                handedness_score = float(item.score or 0.0)
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            x1 = max(0.0, min(xs))
+            y1 = max(0.0, min(ys))
+            x2 = min(1.0, max(xs))
+            y2 = min(1.0, max(ys))
+            if x2 - x1 < 0.004 or y2 - y1 < 0.004:
+                continue
+            detected.append((points, handedness, handedness_score, (x1, y1, x2, y2)))
+        return detected
 
+    def _make_state(self, points, handedness, score, bbox, hand_id):
+        gesture = self.recognizer.classify(points)
+        return HandState(
+            hand_id=hand_id,
+            handedness=handedness,
+            landmarks=points,
+            bbox=bbox,
+            gesture=gesture,
+            confidence=max(0.0, min(1.0, score))
+        )
+
+    def detect(self, frame, confidence=0.25, person_boxes=None):
+        if not self.initialized or not self.available or self.landmarker is None:
+            return []
         try:
-            height, width = frame.shape[:2]
-            scale_factor = 1.60
-            target_width = min(1280, max(width, int(width * scale_factor)))
-            target_height = min(960, max(height, int(height * scale_factor)))
-            enlarged = cv2.resize(
-                frame,
-                (target_width, target_height),
-                interpolation=cv2.INTER_LINEAR
-            )
-            rgb = cv2.cvtColor(
-                enlarged,
-                cv2.COLOR_BGR2RGB
-            )
-            rgb = np.ascontiguousarray(rgb)
+            h, w = frame.shape[:2]
+            candidates = []
 
-            image = mp.Image(
-                image_format=(
-                    mp.ImageFormat.SRGB
-                ),
-                data=rgb
-            )
+            full_scale = min(1.0, 1280.0 / max(w, 1))
+            full = frame
+            if full_scale != 1.0:
+                full = cv2.resize(frame, (int(w * full_scale), int(h * full_scale)), interpolation=cv2.INTER_LINEAR)
+            for points, handedness, score, bbox in self._detect_image(full):
+                mapped = []
+                for x, y, z in points:
+                    mapped.append((x, y, z))
+                candidates.append(self._make_state(mapped, handedness, score, bbox, len(candidates) + 1))
 
-            with self.lock:
-                result = self.landmarker.detect(
-                    image
-                )
-
-            hands = []
-
-            if not result.hand_landmarks:
-                self.stabilizer.stabilize(
-                    []
-                )
-                return hands
-
-            for index, landmarks in enumerate(
-                result.hand_landmarks
-            ):
-                points = [
-                    (
-                        float(point.x),
-                        float(point.y),
-                        float(point.z)
-                    )
-                    for point in landmarks
-                ]
-
-                handedness = "Unknown"
-                handedness_score = 1.0
-
-                if (
-                    result.handedness
-                    and
-                    index <
-                    len(result.handedness)
-                    and
-                    result.handedness[index]
-                ):
-                    handedness_item = (
-                        result.handedness[
-                            index
-                        ][0]
-                    )
-
-                    handedness = (
-                        handedness_item.category_name
-                        or
-                        "Unknown"
-                    )
-
-                    handedness_score = float(
-                        handedness_item.score
-                    )
-
-                xs = [
-                    point[0]
-                    for point in points
-                ]
-
-                ys = [
-                    point[1]
-                    for point in points
-                ]
-
-                x1 = max(
-                    0.0,
-                    min(xs)
-                )
-
-                y1 = max(
-                    0.0,
-                    min(ys)
-                )
-
-                x2 = min(
-                    1.0,
-                    max(xs)
-                )
-
-                y2 = min(
-                    1.0,
-                    max(ys)
-                )
-
-                bbox_width = (
-                    x2 - x1
-                )
-
-                bbox_height = (
-                    y2 - y1
-                )
-
-                if (
-                    bbox_width < 0.008
-                    or
-                    bbox_height < 0.008
-                ):
+            for pb in (person_boxes or [])[:6]:
+                x1, y1, x2, y2 = pb
+                px1 = max(0, int(x1 * w))
+                py1 = max(0, int(y1 * h))
+                px2 = min(w, int(x2 * w))
+                py2 = min(h, int(y2 * h))
+                bw = max(1, px2 - px1)
+                bh = max(1, py2 - py1)
+                pad_x = int(bw * 0.18)
+                pad_y = int(bh * 0.12)
+                cx1 = max(0, px1 - pad_x)
+                cy1 = max(0, py1 - pad_y)
+                cx2 = min(w, px2 + pad_x)
+                cy2 = min(h, py2 + pad_y)
+                crop = frame[cy1:cy2, cx1:cx2]
+                if crop.size == 0:
                     continue
+                ch, cw = crop.shape[:2]
+                scale = min(1.0, 960.0 / max(cw, ch))
+                if scale != 1.0:
+                    proc = cv2.resize(crop, (max(1, int(cw * scale)), max(1, int(ch * scale))), interpolation=cv2.INTER_LINEAR)
+                else:
+                    proc = crop
+                for points, handedness, score, bbox in self._detect_image(proc):
+                    mapped = []
+                    for x, y, z in points:
+                        ox = (x * proc.shape[1] / max(scale, 1e-6) + cx1) / w
+                        oy = (y * proc.shape[0] / max(scale, 1e-6) + cy1) / h
+                        mapped.append((float(ox), float(oy), float(z)))
+                    xs = [p[0] for p in mapped]
+                    ys = [p[1] for p in mapped]
+                    mb = (max(0.0, min(xs)), max(0.0, min(ys)), min(1.0, max(xs)), min(1.0, max(ys)))
+                    candidates.append(self._make_state(mapped, handedness, score, mb, len(candidates) + 1))
 
-                gesture = (
-                    self.recognizer.classify(
-                        points
-                    )
-                )
+            unique = []
+            for hand in candidates:
+                wrist = hand.landmarks[0]
+                duplicate = False
+                for existing in unique:
+                    ew = existing.landmarks[0]
+                    if math.hypot(wrist[0] - ew[0], wrist[1] - ew[1]) < 0.075:
+                        duplicate = True
+                        if hand.confidence > existing.confidence:
+                            unique.remove(existing)
+                        else:
+                            break
+                if not duplicate or not any(
+                    math.hypot(wrist[0] - e.landmarks[0][0], wrist[1] - e.landmarks[0][1]) < 0.075 for e in unique
+                ):
+                    unique.append(hand)
 
-                hands.append(
-                    HandState(
-                        hand_id=index + 1,
-                        handedness=handedness,
-                        landmarks=points,
-                        bbox=(
-                            x1,
-                            y1,
-                            x2,
-                            y2
-                        ),
-                        gesture=gesture,
-                        confidence=max(
-                            0.0,
-                            min(
-                                1.0,
-                                handedness_score
-                            )
-                        )
-                    )
-                )
-
-            return self.stabilizer.stabilize(
-                hands
-            )
-
+            unique = unique[:2]
+            for i, hand in enumerate(unique, 1):
+                hand.hand_id = i
+            return self.stabilizer.stabilize(unique)
         except Exception as exc:
-            self.error = str(exc)
+            self.error = f"{type(exc).__name__}: {exc}"
             return []
 
 
@@ -1540,7 +1493,7 @@ class FaceLandmarkerEngine:
                 num_faces=4,
                 min_face_detection_confidence=0.25,
                 min_face_presence_confidence=0.25,
-                min_tracking_confidence=0.25,
+                min_tracking_confidence=0.15,
                 output_face_blendshapes=True,
                 output_facial_transformation_matrixes=False
             )
@@ -2659,9 +2612,15 @@ class LifeVisionEngine:
         ):
             return []
 
+        person_boxes = [
+            person.bbox
+            for person in people
+        ]
+
         hands = self.hand_engine.detect(
             frame,
-            confidence
+            confidence,
+            person_boxes
         )
 
         if not hands:
@@ -4465,7 +4424,9 @@ def process_frame(
         current_frame_id = ENGINE.frame_id
         ENGINE.ai_cycle += 1
 
-    if show_hands and not ENGINE.hand_engine.initialized:
+    if show_hands and (not ENGINE.hand_engine.initialized or not ENGINE.hand_engine.available):
+        ENGINE.hand_engine.initialized = False
+        ENGINE.hand_engine.initializing = False
         ENGINE.hand_engine.initialize()
 
     started = time.time()
