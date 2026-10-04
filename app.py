@@ -723,20 +723,44 @@ class HandLandmarkerEngine:
         self.landmarker = None
         self.lock = threading.Lock()
         self.recognizer = GestureRecognizer()
+        self.initialized = False
+        self.initializing = False
 
         if not MEDIAPIPE_AVAILABLE:
             self.error = (
                 "MediaPipe is not available."
             )
-            return
+            self.initialized = True
+
+    def initialize(self):
+        with self.lock:
+            if self.initialized:
+                return self.available
+
+            if self.initializing:
+                return False
+
+            self.initializing = True
 
         try:
             self.ensure_model()
             self.create_landmarker()
+
+            with self.lock:
+                self.initialized = True
+                self.initializing = False
+
+            return self.available
+
         except Exception as exc:
-            self.error = (
-                f"Hand engine unavailable: {exc}"
-            )
+            with self.lock:
+                self.error = (
+                    f"Hand engine unavailable: {exc}"
+                )
+                self.initialized = True
+                self.initializing = False
+
+            return False
 
     def ensure_model(self):
         if os.path.exists(
@@ -744,10 +768,34 @@ class HandLandmarkerEngine:
         ):
             return
 
-        urllib.request.urlretrieve(
-            HAND_MODEL_URL,
-            HAND_MODEL_PATH
+        temporary_path = (
+            HAND_MODEL_PATH +
+            ".download"
         )
+
+        try:
+            urllib.request.urlretrieve(
+                HAND_MODEL_URL,
+                temporary_path
+            )
+
+            os.replace(
+                temporary_path,
+                HAND_MODEL_PATH
+            )
+
+        except Exception:
+            try:
+                if os.path.exists(
+                    temporary_path
+                ):
+                    os.remove(
+                        temporary_path
+                    )
+            except Exception:
+                pass
+
+            raise
 
     def create_landmarker(self):
         base_options = python.BaseOptions(
@@ -781,7 +829,8 @@ class HandLandmarkerEngine:
         confidence=0.45
     ):
         if (
-            not self.available
+            not self.initialized
+            or not self.available
             or self.landmarker is None
         ):
             return []
@@ -996,37 +1045,69 @@ GPU_DECORATOR = (
 )
 
 
-OBJECT_GPU_MODEL = YOLO(
-    OBJECT_MODEL
-)
+OBJECT_GPU_MODEL = None
+POSE_GPU_MODEL = None
+MODEL_LOCK = threading.Lock()
+MODEL_ERROR = ""
 
-POSE_GPU_MODEL = YOLO(
-    POSE_MODEL
-)
 
-try:
-    OBJECT_GPU_MODEL.to("cuda")
-except Exception:
-    if (
-        torch is not None
-        and torch.cuda.is_available()
-    ):
-        try:
-            OBJECT_GPU_MODEL.to("cuda")
-        except Exception:
-            pass
+def get_gpu_models():
+    global OBJECT_GPU_MODEL
+    global POSE_GPU_MODEL
+    global MODEL_ERROR
 
-try:
-    POSE_GPU_MODEL.to("cuda")
-except Exception:
-    if (
-        torch is not None
-        and torch.cuda.is_available()
-    ):
-        try:
-            POSE_GPU_MODEL.to("cuda")
-        except Exception:
-            pass
+    with MODEL_LOCK:
+        if (
+            OBJECT_GPU_MODEL is None
+            or POSE_GPU_MODEL is None
+        ):
+            try:
+                if OBJECT_GPU_MODEL is None:
+                    OBJECT_GPU_MODEL = YOLO(
+                        OBJECT_MODEL
+                    )
+
+                    try:
+                        OBJECT_GPU_MODEL.to(
+                            "cuda"
+                        )
+                    except Exception:
+                        if (
+                            torch is not None
+                            and torch.cuda.is_available()
+                        ):
+                            OBJECT_GPU_MODEL.to(
+                                "cuda"
+                            )
+
+                if POSE_GPU_MODEL is None:
+                    POSE_GPU_MODEL = YOLO(
+                        POSE_MODEL
+                    )
+
+                    try:
+                        POSE_GPU_MODEL.to(
+                            "cuda"
+                        )
+                    except Exception:
+                        if (
+                            torch is not None
+                            and torch.cuda.is_available()
+                        ):
+                            POSE_GPU_MODEL.to(
+                                "cuda"
+                            )
+
+            except Exception as exc:
+                MODEL_ERROR = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+                raise
+
+    return (
+        OBJECT_GPU_MODEL,
+        POSE_GPU_MODEL
+    )
 
 
 @GPU_DECORATOR(
@@ -1041,6 +1122,10 @@ def run_gpu_inference(
     show_pose,
     run_pose
 ):
+    object_model, pose_model = (
+        get_gpu_models()
+    )
+
     allowed = set()
 
     if mode == "Gesture & Body Awareness":
@@ -1060,7 +1145,7 @@ def run_gpu_inference(
     object_error = ""
 
     try:
-        object_result = OBJECT_GPU_MODEL.predict(
+        object_result = object_model.predict(
             source=frame,
             conf=float(object_confidence),
             iou=0.45,
@@ -1071,7 +1156,7 @@ def run_gpu_inference(
         )[0]
 
         if object_result.boxes is not None:
-            names = OBJECT_GPU_MODEL.names
+            names = object_model.names
 
             for box in object_result.boxes:
                 cls_id = int(
@@ -1137,7 +1222,7 @@ def run_gpu_inference(
         and mode != "Object & People Awareness"
     ):
         try:
-            pose_result = POSE_GPU_MODEL.predict(
+            pose_result = pose_model.predict(
                 source=frame,
                 conf=float(pose_confidence),
                 iou=0.45,
@@ -1379,19 +1464,19 @@ class LifeVisionEngine:
 
     def submit(self, frame):
         if frame is None:
-            return self.get_output()
+            return
 
         if not isinstance(
             frame,
             np.ndarray
         ):
-            return self.get_output()
+            return
 
         if frame.ndim != 3:
-            return self.get_output()
+            return
 
         if frame.shape[2] != 3:
-            return self.get_output()
+            return
 
         with self.lock:
             self.camera_frames += 1
@@ -1411,9 +1496,7 @@ class LifeVisionEngine:
                     1
                 )
 
-            self.latest_frame = (
-                current_frame.copy()
-            )
+            self.latest_frame = current_frame
 
             self.latest_frame_time = (
                 time.time()
@@ -1423,43 +1506,8 @@ class LifeVisionEngine:
                 self.first_frame_received = True
                 self.last_ai_time = 0.0
 
-            objects = list(
-                self.render_objects
-            )
-
-            people = list(
-                self.render_people
-            )
-
-            hands = list(
-                self.render_hands
-            )
-
-            scene = self.render_scene
-            narrative = self.render_narrative
-
-            rendered = self.render(
-                current_frame,
-                objects,
-                people,
-                hands,
-                scene,
-                narrative
-            )
-
-            snapshot = self.latest_snapshot
-
-            data = self.format_snapshot(
-                snapshot
-            )
-
         with self.worker_condition:
             self.worker_condition.notify()
-
-        return (
-            rendered,
-            data
-        )
 
     def ai_worker(self):
         while self.worker_running:
@@ -1596,6 +1644,13 @@ class LifeVisionEngine:
             self.last_ai_time = now
 
         started = time.time()
+
+        if (
+            show_hands
+            and mode != "Object & People Awareness"
+            and not self.hand_engine.initialized
+        ):
+            self.hand_engine.initialize()
 
         try:
             gpu_result = run_gpu_inference(
@@ -2481,8 +2536,7 @@ class LifeVisionEngine:
                     ", ".join(
                         details
                     )
-                    +
-                    "."
+                    + "."
                 )
 
             if person.keypoints:
@@ -2518,8 +2572,7 @@ class LifeVisionEngine:
                         ", ".join(
                             visible[:8]
                         )
-                        +
-                        "."
+                        + "."
                     )
 
         counts = {}
@@ -2555,8 +2608,7 @@ class LifeVisionEngine:
                 ", ".join(
                     object_text
                 )
-                +
-                "."
+                + "."
             )
 
         if hands:
@@ -2588,8 +2640,7 @@ class LifeVisionEngine:
                     ", ".join(
                         meaningful
                     )
-                    +
-                    "."
+                    + "."
                 )
 
         parts.append(
@@ -3187,6 +3238,13 @@ class LifeVisionEngine:
                 snapshot.runtime_error
             )
 
+        if MODEL_ERROR:
+            runtime_errors.append(
+                "Models: "
+                +
+                MODEL_ERROR
+            )
+
         if runtime_errors:
             diagnostic = (
                 "\n".join(
@@ -3278,12 +3336,15 @@ def process_frame(
         groups
     )
 
-    output, data = ENGINE.submit(
+    ENGINE.submit(
         frame
     )
 
+    data = ENGINE.format_snapshot(
+        ENGINE.latest_snapshot
+    )
+
     return (
-        output,
         data["metrics"],
         data["scene"],
         data["narrative"],
@@ -3346,7 +3407,8 @@ with gr.Blocks(
                 type="numpy",
                 streaming=True,
                 label="LifeVision Camera",
-                elem_id="camera_output"
+                elem_id="camera_output",
+                interactive=True
             )
 
         with gr.Column(
@@ -3362,7 +3424,10 @@ with gr.Blocks(
                 label="System Metrics",
                 value="Waiting for camera...",
                 lines=6,
-                interactive=False
+                interactive=False,
+                elem_classes=[
+                    "metric-box"
+                ]
             )
 
             scene = gr.Textbox(
@@ -3522,7 +3587,7 @@ with gr.Blocks(
             hands_output = gr.Textbox(
                 label="Hand Engine",
                 value=(
-                    "Hand Engine: Loading..."
+                    "Hand Engine: Waiting..."
                 ),
                 lines=5,
                 interactive=False
@@ -3531,7 +3596,9 @@ with gr.Blocks(
             diagnostic_output = gr.Textbox(
                 label="Runtime Diagnostic",
                 value=(
-                    "Loading AI engines..."
+                    "Camera ready. "
+                    "AI engines initialize "
+                    "when processing begins."
                 ),
                 lines=7,
                 interactive=False
@@ -3545,7 +3612,8 @@ with gr.Blocks(
     clear_button.click(
         fn=clear_event_log,
         inputs=[],
-        outputs=events_output
+        outputs=events_output,
+        queue=False
     )
 
     stream_inputs = [
@@ -3565,7 +3633,6 @@ with gr.Blocks(
     ]
 
     stream_outputs = [
-        camera,
         metrics,
         scene,
         narrative,
@@ -3580,8 +3647,10 @@ with gr.Blocks(
         fn=process_frame,
         inputs=stream_inputs,
         outputs=stream_outputs,
-        stream_every=0.03,
-        concurrency_limit=1
+        stream_every=0.10,
+        concurrency_limit=1,
+        queue=False,
+        show_progress="hidden"
     )
 
 
