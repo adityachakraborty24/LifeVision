@@ -4,7 +4,7 @@ import math
 import threading
 import urllib.request
 from dataclasses import dataclass, field
-from collections import deque
+from collections import deque, Counter
 
 try:
     import spaces
@@ -33,7 +33,11 @@ except Exception:
     MEDIAPIPE_AVAILABLE = False
 
 
-APP_VERSION = "18.0"
+APP_VERSION = "19.0"
+
+MODE_OBJECTS = "Object & People Awareness"
+MODE_GESTURE = "Gesture & Body Awareness"
+MODE_SCENE = "Live Scene"
 
 OBJECT_MODEL = "yolo11n.pt"
 POSE_MODEL = "yolo11n-pose.pt"
@@ -58,7 +62,6 @@ os.makedirs(
     CACHE_DIR,
     exist_ok=True
 )
-
 
 OBJECT_GROUPS = {
     "People": [
@@ -130,7 +133,6 @@ OBJECT_GROUPS = {
     ]
 }
 
-
 POSE_CONNECTIONS = [
     (5, 7),
     (7, 9),
@@ -147,7 +149,6 @@ POSE_CONNECTIONS = [
     (0, 5),
     (0, 6)
 ]
-
 
 HAND_CONNECTIONS = [
     (0, 1),
@@ -168,10 +169,8 @@ HAND_CONNECTIONS = [
     (11, 12),
     (9, 13),
     (13, 14),
-    (14, 15),
-    (15, 16)
+    (14, 15)
 ]
-
 
 POSE_NAMES = {
     0: "nose",
@@ -349,8 +348,7 @@ class MotionAnalyzer:
 
 class GestureRecognizer:
     def __init__(self):
-        self.finger_indices = {
-            "thumb": (4, 3),
+        self.finger_pairs = {
             "index": (8, 6),
             "middle": (12, 10),
             "ring": (16, 14),
@@ -373,7 +371,7 @@ class GestureRecognizer:
             np.linalg.norm(bc)
         )
 
-        if denom == 0:
+        if denom <= 1e-8:
             return 180.0
 
         cosine = np.clip(
@@ -386,6 +384,20 @@ class GestureRecognizer:
             math.acos(cosine)
         )
 
+    def normalized_scale(self, landmarks):
+        wrist = landmarks[0]
+        middle_mcp = landmarks[9]
+
+        scale = self.distance(
+            wrist,
+            middle_mcp
+        )
+
+        if scale < 0.02:
+            scale = 0.02
+
+        return scale
+
     def finger_extended(
         self,
         landmarks,
@@ -393,32 +405,95 @@ class GestureRecognizer:
         pip
     ):
         wrist = landmarks[0]
-        tip_point = landmarks[tip]
+        mcp = landmarks[pip - 1]
         pip_point = landmarks[pip]
+        tip_point = landmarks[tip]
 
-        wrist_distance = self.distance(
-            wrist,
+        scale = self.normalized_scale(
+            landmarks
+        )
+
+        wrist_tip = (
+            self.distance(
+                wrist,
+                tip_point
+            )
+            / scale
+        )
+
+        wrist_pip = (
+            self.distance(
+                wrist,
+                pip_point
+            )
+            / scale
+        )
+
+        joint_angle = self.angle(
+            mcp,
+            pip_point,
             tip_point
         )
 
-        pip_distance = self.distance(
-            wrist,
-            pip_point
+        return (
+            wrist_tip >
+            wrist_pip * 1.08
+            and
+            joint_angle > 145
+        )
+
+    def thumb_extended(self, landmarks):
+        scale = self.normalized_scale(
+            landmarks
+        )
+
+        wrist = landmarks[0]
+        thumb_tip = landmarks[4]
+        thumb_ip = landmarks[3]
+        thumb_mcp = landmarks[2]
+
+        tip_distance = (
+            self.distance(
+                wrist,
+                thumb_tip
+            )
+            / scale
+        )
+
+        ip_distance = (
+            self.distance(
+                wrist,
+                thumb_ip
+            )
+            / scale
+        )
+
+        joint_angle = self.angle(
+            landmarks[1],
+            thumb_mcp,
+            thumb_ip
         )
 
         return (
-            wrist_distance >
-            pip_distance * 1.12
+            tip_distance >
+            ip_distance * 1.03
+            and
+            joint_angle > 125
         )
 
     def classify(self, landmarks):
         if len(landmarks) != 21:
-            return "Unknown"
+            return "Hand detected"
 
-        thumb = self.finger_extended(
-            landmarks,
-            4,
-            3
+        scale = self.normalized_scale(
+            landmarks
+        )
+
+        if scale < 0.025:
+            return "Hand detected"
+
+        thumb = self.thumb_extended(
+            landmarks
         )
 
         index = self.finger_extended(
@@ -453,55 +528,349 @@ class GestureRecognizer:
             pinky
         ]
 
-        if (
-            index
-            and middle
-            and ring
-            and pinky
-            and not thumb
-        ):
-            return "Open hand"
+        extended_count = sum(
+            extended
+        )
 
-        if not any(extended):
+        thumb_tip = np.array(
+            landmarks[4]
+        )
+
+        thumb_mcp = np.array(
+            landmarks[2]
+        )
+
+        index_tip = np.array(
+            landmarks[8]
+        )
+
+        thumb_index_distance = (
+            self.distance(
+                landmarks[4],
+                landmarks[8]
+            )
+            / scale
+        )
+
+        if (
+            thumb_index_distance < 0.42
+            and
+            index
+            and
+            not middle
+            and
+            not ring
+            and
+            not pinky
+        ):
+            return "Pinch"
+
+        if (
+            thumb_index_distance < 0.55
+            and
+            middle
+            and
+            ring
+            and
+            pinky
+        ):
+            return "OK"
+
+        if extended_count == 0:
             return "Fist"
 
         if (
-            thumb
-            and not index
-            and not middle
-            and not ring
-            and not pinky
+            index
+            and
+            middle
+            and
+            not ring
+            and
+            not pinky
+            and
+            not thumb
         ):
-            return "Thumbs up"
+            return "Peace"
 
         if (
             index
-            and not middle
-            and not ring
-            and not pinky
+            and
+            not middle
+            and
+            not ring
+            and
+            not pinky
+            and
+            not thumb
         ):
             return "Pointing"
 
         if (
-            middle
-            and not index
-            and not ring
-            and not pinky
+            thumb
+            and
+            not index
+            and
+            not middle
+            and
+            not ring
+            and
+            not pinky
         ):
-            return "Middle finger"
+            vertical_difference = (
+                thumb_tip[1] -
+                thumb_mcp[1]
+            )
+
+            if vertical_difference < -0.10 * scale:
+                return "Thumbs up"
+
+            if vertical_difference > 0.10 * scale:
+                return "Thumbs down"
+
+            return "Thumbs up"
+
+        if extended_count >= 4:
+            return "Open hand"
 
         if (
             index
-            and middle
-            and not ring
-            and not pinky
+            and
+            middle
+            and
+            ring
+            and
+            not pinky
         ):
-            return "Peace"
+            return "Three fingers"
 
-        if all(extended):
-            return "Open hand"
+        if (
+            index
+            and
+            middle
+            and
+            ring
+            and
+            pinky
+            and
+            not thumb
+        ):
+            return "Four fingers"
 
-        return "Hand gesture"
+        if extended_count == 1:
+            return "Hand gesture"
+
+        return "Hand detected"
+
+
+class HandStabilizer:
+    def __init__(self):
+        self.previous = []
+        self.next_id = 1
+        self.histories = {}
+        self.last_seen = {}
+
+    def center(self, hand):
+        return (
+            (hand.bbox[0] + hand.bbox[2]) * 0.5,
+            (hand.bbox[1] + hand.bbox[3]) * 0.5
+        )
+
+    def match(self, hand):
+        cx, cy = self.center(hand)
+
+        best_id = None
+        best_distance = 0.20
+
+        for previous in self.previous:
+            previous_id = previous["id"]
+
+            if previous_id in [
+                item["id"]
+                for item in self.previous
+                if False
+            ]:
+                continue
+
+            px, py = previous["center"]
+
+            distance = math.hypot(
+                cx - px,
+                cy - py
+            )
+
+            if distance < best_distance:
+                if (
+                    hand.handedness == "Unknown"
+                    or
+                    previous["handedness"] == "Unknown"
+                    or
+                    hand.handedness ==
+                    previous["handedness"]
+                ):
+                    best_distance = distance
+                    best_id = previous_id
+
+        if best_id is None:
+            best_id = self.next_id
+            self.next_id += 1
+
+        return best_id
+
+    def stabilize(self, hands):
+        now = time.time()
+        current = []
+        used_ids = set()
+
+        for hand in hands:
+            cx, cy = self.center(
+                hand
+            )
+
+            candidates = []
+
+            for previous in self.previous:
+                previous_id = previous["id"]
+
+                if previous_id in used_ids:
+                    continue
+
+                px, py = previous["center"]
+
+                distance = math.hypot(
+                    cx - px,
+                    cy - py
+                )
+
+                if distance > 0.25:
+                    continue
+
+                handedness_match = (
+                    hand.handedness ==
+                    previous["handedness"]
+                    or
+                    hand.handedness ==
+                    "Unknown"
+                    or
+                    previous["handedness"] ==
+                    "Unknown"
+                )
+
+                if handedness_match:
+                    candidates.append(
+                        (
+                            distance,
+                            previous_id
+                        )
+                    )
+
+            if candidates:
+                candidates.sort(
+                    key=lambda item: item[0]
+                )
+                hand_id = candidates[0][1]
+            else:
+                hand_id = self.next_id
+                self.next_id += 1
+
+            used_ids.add(
+                hand_id
+            )
+
+            history = self.histories.setdefault(
+                hand_id,
+                deque(maxlen=5)
+            )
+
+            history.append(
+                hand.gesture
+            )
+
+            valid_gestures = [
+                value
+                for value in history
+                if value
+                in {
+                    "Open hand",
+                    "Fist",
+                    "Pointing",
+                    "Peace",
+                    "Thumbs up",
+                    "Thumbs down",
+                    "Pinch",
+                    "OK",
+                    "Three fingers",
+                    "Four fingers",
+                    "Hand gesture",
+                    "Hand detected"
+                }
+            ]
+
+            if valid_gestures:
+                counts = Counter(
+                    valid_gestures
+                )
+
+                stable_gesture = (
+                    counts.most_common(1)[0][0]
+                )
+            else:
+                stable_gesture = "Hand detected"
+
+            if (
+                stable_gesture
+                in {
+                    "Hand gesture",
+                    "Hand detected"
+                }
+                and
+                len(history) >= 3
+            ):
+                recent = list(
+                    history
+                )[-3:]
+
+                if len(
+                    set(recent)
+                ) > 1:
+                    stable_gesture = (
+                        "Hand detected"
+                    )
+
+            hand.hand_id = hand_id
+            hand.gesture = stable_gesture
+
+            current.append(
+                {
+                    "id": hand_id,
+                    "center": (cx, cy),
+                    "handedness": hand.handedness
+                }
+            )
+
+            self.last_seen[
+                hand_id
+            ] = now
+
+        self.previous = current
+
+        expired = [
+            hand_id
+            for hand_id, timestamp
+            in self.last_seen.items()
+            if now - timestamp > 2.0
+        ]
+
+        for hand_id in expired:
+            self.last_seen.pop(
+                hand_id,
+                None
+            )
+            self.histories.pop(
+                hand_id,
+                None
+            )
+
+        return hands
 
 
 class PostureAnalyzer:
@@ -520,7 +889,7 @@ class PostureAnalyzer:
 
         x, y, confidence = point
 
-        if confidence < 0.25:
+        if confidence < 0.30:
             return None
 
         return np.array(
@@ -635,7 +1004,8 @@ class PostureAnalyzer:
 
         if (
             shoulder is None
-            or hip is None
+            or
+            hip is None
         ):
             return "Unknown"
 
@@ -655,6 +1025,9 @@ class PostureAnalyzer:
             hip - shoulder
         )
 
+        if torso_length < 10:
+            return "Unknown"
+
         torso_angle = (
             self.angle_from_horizontal(
                 shoulder,
@@ -664,51 +1037,61 @@ class PostureAnalyzer:
 
         if (
             torso_angle is not None
-            and torso_angle < 38
+            and
+            torso_angle < 38
+            and
+            width > height * 0.85
         ):
-            if width > height * 0.9:
-                return "Lying"
+            return "Lying"
 
         if (
-            ankle is not None
-            and knee is not None
+            knee is not None
+            and
+            torso_angle is not None
+            and
+            torso_angle > 55
         ):
-            knee_hip_distance = np.linalg.norm(
-                knee - hip
+            knee_hip_distance = (
+                np.linalg.norm(
+                    knee - hip
+                )
             )
 
-            if torso_angle is not None:
-                if torso_angle > 63:
-                    if (
-                        knee_hip_distance
-                        < torso_length * 1.45
-                    ):
-                        return "Sitting"
+            if (
+                knee_hip_distance
+                < torso_length * 1.55
+            ):
+                return "Sitting"
 
         if (
             torso_angle is not None
-            and torso_angle > 62
+            and
+            torso_angle > 62
         ):
             return "Standing"
 
         if (
             nose is not None
-            and shoulder is not None
+            and
+            shoulder is not None
         ):
-            head_distance = np.linalg.norm(
-                nose - shoulder
+            head_distance = (
+                np.linalg.norm(
+                    nose - shoulder
+                )
             )
 
             if (
                 torso_length > 0
-                and head_distance
-                < torso_length * 0.8
+                and
+                head_distance
+                < torso_length * 0.85
+                and
+                torso_angle is not None
+                and
+                torso_angle > 55
             ):
-                if (
-                    torso_angle is not None
-                    and torso_angle > 55
-                ):
-                    return "Standing"
+                return "Standing"
 
         if width > height * 1.15:
             return "Lying"
@@ -723,6 +1106,7 @@ class HandLandmarkerEngine:
         self.landmarker = None
         self.lock = threading.Lock()
         self.recognizer = GestureRecognizer()
+        self.stabilizer = HandStabilizer()
         self.initialized = False
         self.initializing = False
 
@@ -808,10 +1192,10 @@ class HandLandmarkerEngine:
                 running_mode=(
                     vision.RunningMode.IMAGE
                 ),
-                num_hands=8,
-                min_hand_detection_confidence=0.45,
-                min_hand_presence_confidence=0.45,
-                min_tracking_confidence=0.45
+                num_hands=2,
+                min_hand_detection_confidence=0.40,
+                min_hand_presence_confidence=0.40,
+                min_tracking_confidence=0.40
             )
         )
 
@@ -830,8 +1214,10 @@ class HandLandmarkerEngine:
     ):
         if (
             not self.initialized
-            or not self.available
-            or self.landmarker is None
+            or
+            not self.available
+            or
+            self.landmarker is None
         ):
             return []
 
@@ -856,6 +1242,9 @@ class HandLandmarkerEngine:
             hands = []
 
             if not result.hand_landmarks:
+                self.stabilizer.stabilize(
+                    []
+                )
                 return hands
 
             for index, landmarks in enumerate(
@@ -871,18 +1260,31 @@ class HandLandmarkerEngine:
                 ]
 
                 handedness = "Unknown"
+                handedness_score = 1.0
 
                 if (
                     result.handedness
-                    and index
-                    < len(result.handedness)
+                    and
+                    index <
+                    len(result.handedness)
+                    and
+                    result.handedness[index]
                 ):
-                    if result.handedness[index]:
-                        handedness = (
-                            result.handedness[
-                                index
-                            ][0].category_name
-                        )
+                    handedness_item = (
+                        result.handedness[
+                            index
+                        ][0]
+                    )
+
+                    handedness = (
+                        handedness_item.category_name
+                        or
+                        "Unknown"
+                    )
+
+                    handedness_score = float(
+                        handedness_item.score
+                    )
 
                 xs = [
                     point[0]
@@ -914,26 +1316,26 @@ class HandLandmarkerEngine:
                     max(ys)
                 )
 
-                gesture = self.recognizer.classify(
-                    points
+                bbox_width = (
+                    x2 - x1
                 )
 
-                score = 1.0
+                bbox_height = (
+                    y2 - y1
+                )
 
                 if (
-                    result.handedness
-                    and index
-                    < len(result.handedness)
+                    bbox_width < 0.025
+                    or
+                    bbox_height < 0.025
                 ):
-                    if result.handedness[index]:
-                        score = float(
-                            result.handedness[
-                                index
-                            ][0].score
-                        )
-
-                if score < confidence:
                     continue
+
+                gesture = (
+                    self.recognizer.classify(
+                        points
+                    )
+                )
 
                 hands.append(
                     HandState(
@@ -947,11 +1349,19 @@ class HandLandmarkerEngine:
                             y2
                         ),
                         gesture=gesture,
-                        confidence=score
+                        confidence=max(
+                            0.0,
+                            min(
+                                1.0,
+                                handedness_score
+                            )
+                        )
                     )
                 )
 
-            return hands
+            return self.stabilizer.stabilize(
+                hands
+            )
 
         except Exception as exc:
             self.error = str(exc)
@@ -1044,7 +1454,6 @@ GPU_DECORATOR = (
     else _identity_decorator
 )
 
-
 OBJECT_GPU_MODEL = None
 POSE_GPU_MODEL = None
 MODEL_LOCK = threading.Lock()
@@ -1057,52 +1466,40 @@ def get_gpu_models():
     global MODEL_ERROR
 
     with MODEL_LOCK:
-        if (
-            OBJECT_GPU_MODEL is None
-            or POSE_GPU_MODEL is None
-        ):
-            try:
-                if OBJECT_GPU_MODEL is None:
-                    OBJECT_GPU_MODEL = YOLO(
-                        OBJECT_MODEL
-                    )
-
-                    try:
-                        OBJECT_GPU_MODEL.to(
-                            "cuda"
-                        )
-                    except Exception:
-                        if (
-                            torch is not None
-                            and torch.cuda.is_available()
-                        ):
-                            OBJECT_GPU_MODEL.to(
-                                "cuda"
-                            )
-
-                if POSE_GPU_MODEL is None:
-                    POSE_GPU_MODEL = YOLO(
-                        POSE_MODEL
-                    )
-
-                    try:
-                        POSE_GPU_MODEL.to(
-                            "cuda"
-                        )
-                    except Exception:
-                        if (
-                            torch is not None
-                            and torch.cuda.is_available()
-                        ):
-                            POSE_GPU_MODEL.to(
-                                "cuda"
-                            )
-
-            except Exception as exc:
-                MODEL_ERROR = (
-                    f"{type(exc).__name__}: {exc}"
+        try:
+            if OBJECT_GPU_MODEL is None:
+                OBJECT_GPU_MODEL = YOLO(
+                    OBJECT_MODEL
                 )
-                raise
+
+                if (
+                    torch is not None
+                    and
+                    torch.cuda.is_available()
+                ):
+                    OBJECT_GPU_MODEL.to(
+                        "cuda"
+                    )
+
+            if POSE_GPU_MODEL is None:
+                POSE_GPU_MODEL = YOLO(
+                    POSE_MODEL
+                )
+
+                if (
+                    torch is not None
+                    and
+                    torch.cuda.is_available()
+                ):
+                    POSE_GPU_MODEL.to(
+                        "cuda"
+                    )
+
+        except Exception as exc:
+            MODEL_ERROR = (
+                f"{type(exc).__name__}: {exc}"
+            )
+            raise
 
     return (
         OBJECT_GPU_MODEL,
@@ -1128,7 +1525,7 @@ def run_gpu_inference(
 
     allowed = set()
 
-    if mode == "Gesture & Body Awareness":
+    if mode == MODE_GESTURE:
         allowed.add("person")
     else:
         for group in groups:
@@ -1147,7 +1544,9 @@ def run_gpu_inference(
     try:
         object_result = object_model.predict(
             source=frame,
-            conf=float(object_confidence),
+            conf=float(
+                object_confidence
+            ),
             iou=0.45,
             imgsz=320,
             max_det=30,
@@ -1170,6 +1569,20 @@ def run_gpu_inference(
                 label = names[cls_id]
 
                 if label not in allowed:
+                    continue
+
+                required_confidence = (
+                    0.35
+                    if label == "person"
+                    else max(
+                        0.40,
+                        float(
+                            object_confidence
+                        )
+                    )
+                )
+
+                if confidence < required_confidence:
                     continue
 
                 coordinates = [
@@ -1218,13 +1631,17 @@ def run_gpu_inference(
 
     if (
         show_pose
-        and run_pose
-        and mode != "Object & People Awareness"
+        and
+        run_pose
+        and
+        mode != MODE_OBJECTS
     ):
         try:
             pose_result = pose_model.predict(
                 source=frame,
-                conf=float(pose_confidence),
+                conf=float(
+                    pose_confidence
+                ),
                 iou=0.45,
                 imgsz=320,
                 max_det=10,
@@ -1234,7 +1651,8 @@ def run_gpu_inference(
 
             if (
                 pose_result.keypoints is not None
-                and pose_result.boxes is not None
+                and
+                pose_result.boxes is not None
             ):
                 pose_boxes = (
                     pose_result.boxes.xyxy
@@ -1310,11 +1728,12 @@ class LifeVisionEngine:
 
         self.process_fps_target = 4.0
         self.last_ai_time = 0.0
+
         self.ai_times = deque(
             maxlen=20
         )
 
-        self.mode = "Live Scene"
+        self.mode = MODE_SCENE
 
         self.object_confidence = 0.35
         self.pose_confidence = 0.35
@@ -1362,14 +1781,20 @@ class LifeVisionEngine:
         self.render_people = []
         self.render_hands = []
 
-        self.render_scene = "Waiting for camera..."
+        self.render_scene = (
+            "Waiting for camera..."
+        )
+
         self.render_narrative = (
             "Start the camera to begin LifeVision."
         )
 
         self.processing_lock = threading.Lock()
 
-        self.worker_condition = threading.Condition()
+        self.worker_condition = (
+            threading.Condition()
+        )
+
         self.worker_running = True
 
         self.worker_thread = threading.Thread(
@@ -1381,9 +1806,7 @@ class LifeVisionEngine:
 
         self.last_ai_duration = 0.0
         self.ai_cycle = 0
-
         self.last_pose_cycle = -1
-
         self.first_frame_received = False
 
     def update_config(
@@ -1404,8 +1827,15 @@ class LifeVisionEngine:
         with self.lock:
             self.mode = (
                 mode
-                or "Live Scene"
+                or MODE_SCENE
             )
+
+            if self.mode not in {
+                MODE_OBJECTS,
+                MODE_GESTURE,
+                MODE_SCENE
+            }:
+                self.mode = MODE_SCENE
 
             self.process_fps_target = max(
                 1.0,
@@ -1418,19 +1848,37 @@ class LifeVisionEngine:
                 )
             )
 
-            self.object_confidence = float(
-                object_confidence
-                or 0.35
+            self.object_confidence = max(
+                0.10,
+                min(
+                    0.90,
+                    float(
+                        object_confidence
+                        or 0.35
+                    )
+                )
             )
 
-            self.pose_confidence = float(
-                pose_confidence
-                or 0.35
+            self.pose_confidence = max(
+                0.10,
+                min(
+                    0.90,
+                    float(
+                        pose_confidence
+                        or 0.35
+                    )
+                )
             )
 
-            self.hand_confidence = float(
-                hand_confidence
-                or 0.45
+            self.hand_confidence = max(
+                0.10,
+                min(
+                    0.90,
+                    float(
+                        hand_confidence
+                        or 0.45
+                    )
+                )
             )
 
             self.show_boxes = bool(
@@ -1481,8 +1929,10 @@ class LifeVisionEngine:
         with self.lock:
             self.camera_frames += 1
 
-            current_frame = np.ascontiguousarray(
-                frame
+            current_frame = (
+                np.ascontiguousarray(
+                    frame
+                )
             )
 
             current_frame = cv2.cvtColor(
@@ -1496,7 +1946,9 @@ class LifeVisionEngine:
                     1
                 )
 
-            self.latest_frame = current_frame
+            self.latest_frame = (
+                current_frame
+            )
 
             self.latest_frame_time = (
                 time.time()
@@ -1544,11 +1996,9 @@ class LifeVisionEngine:
                 now = time.time()
 
                 wait_time = (
-                    interval
-                    -
+                    interval -
                     (
-                        now
-                        -
+                        now -
                         last_ai_time
                     )
                 )
@@ -1582,7 +2032,9 @@ class LifeVisionEngine:
             if self.latest_frame is None:
                 return
 
-            frame = self.latest_frame.copy()
+            frame = (
+                self.latest_frame.copy()
+            )
 
             now = time.time()
 
@@ -1622,7 +2074,9 @@ class LifeVisionEngine:
                 self.hand_confidence
             )
 
-            show_hands = self.show_hands
+            show_hands = (
+                self.show_hands
+            )
 
             self.frame_id += 1
 
@@ -1634,10 +2088,13 @@ class LifeVisionEngine:
 
             run_pose = (
                 show_pose
-                and mode != "Object & People Awareness"
-                and (
+                and
+                mode != MODE_OBJECTS
+                and
+                (
                     self.ai_cycle % 2 == 1
-                    or self.last_pose_cycle < 0
+                    or
+                    self.last_pose_cycle < 0
                 )
             )
 
@@ -1647,8 +2104,10 @@ class LifeVisionEngine:
 
         if (
             show_hands
-            and mode != "Object & People Awareness"
-            and not self.hand_engine.initialized
+            and
+            mode != MODE_OBJECTS
+            and
+            not self.hand_engine.initialized
         ):
             self.hand_engine.initialize()
 
@@ -1688,7 +2147,9 @@ class LifeVisionEngine:
             )
 
             with self.lock:
-                self.last_ai_duration = duration
+                self.last_ai_duration = (
+                    duration
+                )
 
                 self.ai_times.append(
                     duration
@@ -1750,7 +2211,8 @@ class LifeVisionEngine:
                 gpu_result,
                 tuple
             )
-            or len(gpu_result) != 4
+            or
+            len(gpu_result) != 4
         ):
             gpu_result = (
                 [],
@@ -1797,8 +2259,8 @@ class LifeVisionEngine:
 
         if (
             show_hands
-            and self.mode
-            != "Object & People Awareness"
+            and
+            self.mode != MODE_OBJECTS
         ):
             hands = self.detect_hands(
                 frame,
@@ -1806,23 +2268,54 @@ class LifeVisionEngine:
                 hand_confidence
             )
 
-        scene = self.build_scene(
-            objects,
-            people
-        )
+        if self.mode == MODE_OBJECTS:
+            scene = self.build_object_scene(
+                objects,
+                people
+            )
 
-        narrative = (
-            self.build_narrative(
+            narrative = (
+                self.build_object_narrative(
+                    objects,
+                    people,
+                    scene
+                )
+            )
+
+        elif self.mode == MODE_GESTURE:
+            scene = self.build_body_scene(
+                people,
+                hands
+            )
+
+            narrative = (
+                self.build_body_narrative(
+                    people,
+                    hands,
+                    scene
+                )
+            )
+
+        else:
+            scene = self.build_scene(
                 objects,
                 people,
-                hands,
-                scene
+                hands
             )
-        )
+
+            narrative = (
+                self.build_narrative(
+                    objects,
+                    people,
+                    hands,
+                    scene
+                )
+            )
 
         self.update_events(
             scene,
-            people
+            people,
+            hands
         )
 
         if self.ai_times:
@@ -2105,9 +2598,10 @@ class LifeVisionEngine:
     ):
         if (
             not people
-            or self.mode
-            == "Object & People Awareness"
-            or not self.show_pose
+            or
+            self.mode == MODE_OBJECTS
+            or
+            not self.show_pose
         ):
             return
 
@@ -2170,7 +2664,8 @@ class LifeVisionEngine:
 
             if (
                 best_person is None
-                or best_iou < 0.15
+                or
+                best_iou < 0.15
             ):
                 continue
 
@@ -2289,8 +2784,8 @@ class LifeVisionEngine:
     ):
         if (
             not self.show_hands
-            or self.mode
-            == "Object & People Awareness"
+            or
+            self.mode == MODE_OBJECTS
         ):
             return []
 
@@ -2300,11 +2795,18 @@ class LifeVisionEngine:
         )
 
         if not hands:
+            for person in people:
+                person.hands = []
+                person.gestures = []
             return []
 
         height, width = (
             frame.shape[:2]
         )
+
+        for person in people:
+            person.hands = []
+            person.gestures = []
 
         for hand in hands:
             cx = (
@@ -2329,31 +2831,36 @@ class LifeVisionEngine:
                     person.center
                 )
 
-                if (
-                    person.bbox[0]
+                expanded_bbox = (
+                    person.bbox[0] - 80,
+                    person.bbox[1] - 80,
+                    person.bbox[2] + 80,
+                    person.bbox[3] + 80
+                )
+
+                inside = (
+                    expanded_bbox[0]
                     <= cx
-                    <= person.bbox[2]
+                    <= expanded_bbox[2]
                     and
-                    person.bbox[1]
+                    expanded_bbox[1]
                     <= cy
-                    <= person.bbox[3]
-                ):
-                    nearest = person
-                    break
+                    <= expanded_bbox[3]
+                )
 
                 distance = math.hypot(
                     cx - px,
                     cy - py
                 )
 
-                if (
-                    distance
-                    < nearest_distance
-                ):
-                    nearest_distance = (
-                        distance
-                    )
+                if inside:
+                    if distance < nearest_distance:
+                        nearest = person
+                        nearest_distance = distance
+
+                elif distance < nearest_distance:
                     nearest = person
+                    nearest_distance = distance
 
             if nearest is not None:
                 nearest.hands.append(
@@ -2370,29 +2877,23 @@ class LifeVisionEngine:
 
         return hands
 
-    def build_scene(
+    def build_object_scene(
         self,
         objects,
         people
     ):
-        count = len(people)
-
         animal_count = sum(
             1
             for obj in objects
             if obj.label
-            in OBJECT_GROUPS[
-                "Animals"
-            ]
+            in OBJECT_GROUPS["Animals"]
         )
 
         vehicle_count = sum(
             1
             for obj in objects
             if obj.label
-            in OBJECT_GROUPS[
-                "Vehicles"
-            ]
+            in OBJECT_GROUPS["Vehicles"]
         )
 
         non_people = [
@@ -2402,64 +2903,62 @@ class LifeVisionEngine:
         ]
 
         if (
-            count == 0
-            and animal_count == 0
-            and not non_people
+            not people
+            and
+            not non_people
         ):
-            return (
-                "No recognized subjects"
-            )
+            return "No recognized objects"
 
         if (
-            count > 1
-            and animal_count > 0
+            len(people) > 1
+            and
+            animal_count > 0
         ):
-            return (
-                "Multiple humans and animals"
-            )
+            return "Multiple people and animals"
 
         if (
-            count > 1
-            and non_people
+            len(people) > 1
+            and
+            non_people
         ):
-            return (
-                "Multiple humans and objects"
-            )
+            return "Multiple people and objects"
 
-        if count > 1:
-            return "Multiple humans"
+        if len(people) > 1:
+            return "Multiple people"
 
         if (
-            count == 1
-            and animal_count > 0
+            len(people) == 1
+            and
+            animal_count > 0
         ):
-            return "Human and animal"
+            return "Person and animal"
 
         if (
-            count == 1
-            and vehicle_count > 0
+            len(people) == 1
+            and
+            vehicle_count > 0
         ):
-            return "Human and vehicle"
+            return "Person and vehicle"
 
         if (
-            count == 1
-            and non_people
+            len(people) == 1
+            and
+            non_people
         ):
-            return "Human and objects"
+            return "Person and objects"
 
-        if count == 1:
-            return "Single human"
+        if len(people) == 1:
+            return "Single person"
 
         if animal_count > 0:
             return "Animals detected"
 
         return "Objects detected"
 
-    def build_narrative(
+    def build_object_narrative(
         self,
         objects,
         people,
-        hands,
         scene
     ):
         parts = []
@@ -2470,110 +2969,12 @@ class LifeVisionEngine:
             )
         elif len(people) == 1:
             parts.append(
-                "1 person is visible."
+                "1 person is confirmed."
             )
         else:
             parts.append(
-                f"{len(people)} people are visible."
+                f"{len(people)} people are confirmed."
             )
-
-        for person in sorted(
-            people,
-            key=lambda p: p.person_id
-        ):
-            details = []
-
-            if (
-                person.posture
-                != "Unknown"
-            ):
-                details.append(
-                    person.posture.lower()
-                )
-
-            if (
-                person.movement
-                != "Still"
-            ):
-                details.append(
-                    person.movement.lower()
-                )
-
-            if person.hands:
-                hand_count = len(
-                    person.hands
-                )
-
-                details.append(
-                    f"{hand_count} hand"
-                    f"{'s' if hand_count != 1 else ''}"
-                    " visible"
-                )
-
-            gestures = [
-                gesture
-                for gesture
-                in person.gestures
-                if gesture != "Unknown"
-            ]
-
-            if gestures:
-                details.append(
-                    "gesture: "
-                    +
-                    ", ".join(
-                        dict.fromkeys(
-                            gestures
-                        )
-                    )
-                )
-
-            if details:
-                parts.append(
-                    f"Person {person.person_id} "
-                    f"is "
-                    +
-                    ", ".join(
-                        details
-                    )
-                    + "."
-                )
-
-            if person.keypoints:
-                visible = []
-
-                for index, name in (
-                    POSE_NAMES.items()
-                ):
-                    if (
-                        index
-                        >= len(
-                            person.keypoints
-                        )
-                    ):
-                        continue
-
-                    if (
-                        person.keypoints[
-                            index
-                        ][2]
-                        >= 0.4
-                    ):
-                        visible.append(
-                            name
-                        )
-
-                if visible:
-                    parts.append(
-                        f"Person "
-                        f"{person.person_id} "
-                        f"body landmarks: "
-                        +
-                        ", ".join(
-                            visible[:8]
-                        )
-                        + "."
-                    )
 
         counts = {}
 
@@ -2603,49 +3004,448 @@ class LifeVisionEngine:
                 )
 
             parts.append(
-                "Visible objects: "
+                "Confirmed objects: "
                 +
                 ", ".join(
                     object_text
                 )
-                + "."
+                +
+                "."
+            )
+        else:
+            parts.append(
+                "No non-person object is currently confirmed."
             )
 
-        if hands:
-            gesture_counts = {}
+        parts.append(
+            f"Object scene: {scene}."
+        )
 
-            for hand in hands:
-                gesture_counts[
-                    hand.gesture
-                ] = (
-                    gesture_counts.get(
-                        hand.gesture,
-                        0
-                    )
-                    +
-                    1
+        return " ".join(parts)
+
+    def build_body_scene(
+        self,
+        people,
+        hands
+    ):
+        if not people and not hands:
+            return "No confirmed human body"
+
+        if len(people) > 1:
+            if len(hands) > 0:
+                return "Multiple people with hands visible"
+            return "Multiple people"
+
+        if len(people) == 1:
+            if len(hands) == 2:
+                return "Person with two hands visible"
+
+            if len(hands) == 1:
+                return "Person with one hand visible"
+
+            return "Single person"
+
+        if len(hands) == 2:
+            return "Two hands visible"
+
+        return "One hand visible"
+
+    def build_body_narrative(
+        self,
+        people,
+        hands,
+        scene
+    ):
+        parts = []
+
+        if not people:
+            if len(hands) == 2:
+                parts.append(
+                    "2 hands are detected."
+                )
+            elif len(hands) == 1:
+                parts.append(
+                    "1 hand is detected."
+                )
+            else:
+                parts.append(
+                    "No person or hand is currently confirmed."
+                )
+        else:
+            if len(people) == 1:
+                parts.append(
+                    "1 person is confirmed."
+                )
+            else:
+                parts.append(
+                    f"{len(people)} people are confirmed."
                 )
 
-            meaningful = [
-                f"{count} {gesture}"
-                for gesture, count
-                in gesture_counts.items()
-                if gesture != "Unknown"
-            ]
-
-            if meaningful:
+        if hands:
+            if len(hands) == 1:
                 parts.append(
-                    "Hand activity: "
+                    "1 hand is visible."
+                )
+            else:
+                parts.append(
+                    f"{len(hands)} hands are visible."
+                )
+
+            gesture_counts = Counter(
+                hand.gesture
+                for hand in hands
+                if hand.gesture
+                not in {
+                    "Hand detected",
+                    "Hand gesture"
+                }
+            )
+
+            if gesture_counts:
+                gesture_text = []
+
+                for gesture, count in (
+                    gesture_counts.items()
+                ):
+                    if count == 1:
+                        gesture_text.append(
+                            gesture
+                        )
+                    else:
+                        gesture_text.append(
+                            f"{gesture} ({count})"
+                        )
+
+                parts.append(
+                    "Recognized gestures: "
                     +
                     ", ".join(
-                        meaningful
+                        gesture_text
                     )
-                    + "."
+                    +
+                    "."
+                )
+            else:
+                parts.append(
+                    "The hands are detected, but no stable specific gesture is confirmed."
+                )
+
+        for person in people:
+            details = []
+
+            if person.posture != "Unknown":
+                details.append(
+                    f"posture: {person.posture}"
+                )
+
+            if person.movement != "Still":
+                details.append(
+                    f"movement: {person.movement}"
+                )
+
+            if details:
+                parts.append(
+                    f"Person {person.person_id}: "
+                    +
+                    ", ".join(
+                        details
+                    )
+                    +
+                    "."
                 )
 
         parts.append(
-            f"Scene classification: "
-            f"{scene}."
+            f"Body scene: {scene}."
+        )
+
+        return " ".join(parts)
+
+    def build_scene(
+        self,
+        objects,
+        people,
+        hands
+    ):
+        animal_count = sum(
+            1
+            for obj in objects
+            if obj.label
+            in OBJECT_GROUPS["Animals"]
+        )
+
+        vehicle_count = sum(
+            1
+            for obj in objects
+            if obj.label
+            in OBJECT_GROUPS["Vehicles"]
+        )
+
+        non_people = [
+            obj
+            for obj in objects
+            if obj.label != "person"
+        ]
+
+        hand_count = len(
+            hands
+        )
+
+        if (
+            not people
+            and
+            not non_people
+            and
+            hand_count == 0
+        ):
+            return "No recognized subjects"
+
+        if (
+            len(people) > 1
+            and
+            animal_count > 0
+        ):
+            return "Multiple people and animals"
+
+        if (
+            len(people) > 1
+            and
+            non_people
+        ):
+            return "Multiple people and objects"
+
+        if (
+            len(people) > 1
+            and
+            hand_count > 0
+        ):
+            return "Multiple people with hands visible"
+
+        if len(people) > 1:
+            return "Multiple people"
+
+        if (
+            len(people) == 1
+            and
+            animal_count > 0
+        ):
+            return "Person and animal"
+
+        if (
+            len(people) == 1
+            and
+            vehicle_count > 0
+        ):
+            return "Person and vehicle"
+
+        if (
+            len(people) == 1
+            and
+            non_people
+            and
+            hand_count > 0
+        ):
+            return "Person, objects and hands"
+
+        if (
+            len(people) == 1
+            and
+            non_people
+        ):
+            return "Person and objects"
+
+        if (
+            len(people) == 1
+            and
+            hand_count == 2
+        ):
+            return "Person with two hands visible"
+
+        if (
+            len(people) == 1
+            and
+            hand_count == 1
+        ):
+            return "Person with one hand visible"
+
+        if len(people) == 1:
+            return "Single person"
+
+        if hand_count == 2:
+            return "Two hands visible"
+
+        if hand_count == 1:
+            return "One hand visible"
+
+        if animal_count > 0:
+            return "Animals detected"
+
+        return "Objects detected"
+
+    def build_narrative(
+        self,
+        objects,
+        people,
+        hands,
+        scene
+    ):
+        parts = []
+
+        if len(people) == 0:
+            if len(hands) == 2:
+                parts.append(
+                    "2 hands are visible."
+                )
+            elif len(hands) == 1:
+                parts.append(
+                    "1 hand is visible."
+                )
+            else:
+                parts.append(
+                    "No person is currently confirmed."
+                )
+        elif len(people) == 1:
+            parts.append(
+                "1 person is visible."
+            )
+        else:
+            parts.append(
+                f"{len(people)} people are visible."
+            )
+
+        if hands:
+            if len(hands) == 1:
+                parts.append(
+                    "1 hand is detected."
+                )
+            else:
+                parts.append(
+                    f"{len(hands)} hands are detected."
+                )
+
+            gesture_counts = Counter(
+                hand.gesture
+                for hand in hands
+                if hand.gesture
+                not in {
+                    "Hand detected",
+                    "Hand gesture"
+                }
+            )
+
+            if gesture_counts:
+                gesture_text = []
+
+                for gesture, count in (
+                    gesture_counts.items()
+                ):
+                    if count == 1:
+                        gesture_text.append(
+                            gesture
+                        )
+                    else:
+                        gesture_text.append(
+                            f"{gesture} ({count})"
+                        )
+
+                parts.append(
+                    "Stable hand gestures: "
+                    +
+                    ", ".join(
+                        gesture_text
+                    )
+                    +
+                    "."
+                )
+            else:
+                parts.append(
+                    "Hands are detected without a stable specific gesture."
+                )
+
+        for person in sorted(
+            people,
+            key=lambda p: p.person_id
+        ):
+            details = []
+
+            if (
+                person.posture
+                != "Unknown"
+            ):
+                details.append(
+                    f"posture: "
+                    f"{person.posture.lower()}"
+                )
+
+            if (
+                person.movement
+                != "Still"
+            ):
+                details.append(
+                    f"movement: "
+                    f"{person.movement.lower()}"
+                )
+
+            if person.hands:
+                hand_count = len(
+                    person.hands
+                )
+
+                details.append(
+                    f"{hand_count} hand"
+                    f"{'s' if hand_count != 1 else ''}"
+                    " visible"
+                )
+
+            if details:
+                parts.append(
+                    f"Person {person.person_id}: "
+                    +
+                    ", ".join(
+                        details
+                    )
+                    +
+                    "."
+                )
+
+        counts = {}
+
+        for obj in objects:
+            if obj.label == "person":
+                continue
+
+            counts[obj.label] = (
+                counts.get(
+                    obj.label,
+                    0
+                )
+                +
+                1
+            )
+
+        if counts:
+            object_text = []
+
+            for label, count in sorted(
+                counts.items(),
+                key=lambda item: item[0]
+            ):
+                object_text.append(
+                    f"{count} {label}"
+                    f"{'s' if count != 1 else ''}"
+                )
+
+            parts.append(
+                "Confirmed objects: "
+                +
+                ", ".join(
+                    object_text
+                )
+                +
+                "."
+            )
+
+        parts.append(
+            f"Overall scene: {scene}."
         )
 
         return " ".join(parts)
@@ -2653,7 +3453,8 @@ class LifeVisionEngine:
     def update_events(
         self,
         scene,
-        people
+        people,
+        hands
     ):
         self.events.add(
             "scene",
@@ -2663,6 +3464,11 @@ class LifeVisionEngine:
         self.events.add(
             "people",
             f"People count: {len(people)}"
+        )
+
+        self.events.add(
+            "hands",
+            f"Hands count: {len(hands)}"
         )
 
         for person in people:
@@ -2693,6 +3499,34 @@ class LifeVisionEngine:
                     f"{gestures}"
                 )
 
+        if hands:
+            gestures = sorted(
+                set(
+                    hand.gesture
+                    for hand in hands
+                )
+            )
+
+            meaningful = [
+                gesture
+                for gesture in gestures
+                if gesture
+                not in {
+                    "Hand detected",
+                    "Hand gesture"
+                }
+            ]
+
+            if meaningful:
+                self.events.add(
+                    "global_gesture",
+                    "Stable gestures: "
+                    +
+                    ", ".join(
+                        meaningful
+                    )
+                )
+
     def render(
         self,
         frame,
@@ -2718,8 +3552,14 @@ class LifeVisionEngine:
 
                 cv2.rectangle(
                     output,
-                    (int(x1), int(y1)),
-                    (int(x2), int(y2)),
+                    (
+                        int(x1),
+                        int(y1)
+                    ),
+                    (
+                        int(x2),
+                        int(y2)
+                    ),
                     (255, 210, 50),
                     thickness
                 )
@@ -2730,7 +3570,10 @@ class LifeVisionEngine:
                         f"{obj.confidence:.0%}"
                     )
 
-                    if obj.label == "person":
+                    if (
+                        obj.label ==
+                        "person"
+                    ):
                         label += (
                             f"  P{obj.track_id}"
                         )
@@ -2785,7 +3628,8 @@ class LifeVisionEngine:
         for a, b in POSE_CONNECTIONS:
             if (
                 a >= len(keypoints)
-                or b >= len(keypoints)
+                or
+                b >= len(keypoints)
             ):
                 continue
 
@@ -2794,7 +3638,8 @@ class LifeVisionEngine:
 
             if (
                 p1[2] < 0.35
-                or p2[2] < 0.35
+                or
+                p2[2] < 0.35
             ):
                 continue
 
@@ -2858,7 +3703,8 @@ class LifeVisionEngine:
         for a, b in HAND_CONNECTIONS:
             if (
                 a >= len(points)
-                or b >= len(points)
+                or
+                b >= len(points)
             ):
                 continue
 
@@ -2891,11 +3737,23 @@ class LifeVisionEngine:
             height
         )
 
+        gesture_text = (
+            hand.gesture
+        )
+
+        if (
+            hand.gesture ==
+            "Hand detected"
+        ):
+            gesture_text = (
+                "Hand detected"
+            )
+
         self.draw_label(
             frame,
             (
                 f"{hand.handedness}: "
-                f"{hand.gesture}"
+                f"{gesture_text}"
             ),
             x1,
             max(
@@ -3201,6 +4059,27 @@ class LifeVisionEngine:
             else "Unavailable"
         )
 
+        hand_lines = [
+            f"Hand Engine: {hand_status}",
+            f"Detected hands: {len(snapshot.hands)}"
+        ]
+
+        if len(snapshot.hands) == 1:
+            hand_lines.append(
+                "Hand count: 1 hand detected"
+            )
+
+        elif len(snapshot.hands) == 2:
+            hand_lines.append(
+                "Hand count: 2 hands detected"
+            )
+
+        for hand in snapshot.hands:
+            hand_lines.append(
+                f"{hand.handedness}: "
+                f"{hand.gesture}"
+            )
+
         runtime_errors = []
 
         if self.object_error:
@@ -3277,10 +4156,9 @@ class LifeVisionEngine:
                 f"{self.mode}"
             ),
             "hands": (
-                f"Hand Engine: "
-                f"{hand_status}\n"
-                f"Detected hands: "
-                f"{len(snapshot.hands)}"
+                "\n".join(
+                    hand_lines
+                )
             ),
             "diagnostic": diagnostic
         }
@@ -3459,11 +4337,11 @@ with gr.Blocks(
 
             mode = gr.Radio(
                 choices=[
-                    "Object & People Awareness",
-                    "Gesture & Body Awareness",
-                    "Live Scene"
+                    MODE_OBJECTS,
+                    MODE_GESTURE,
+                    MODE_SCENE
                 ],
-                value="Live Scene",
+                value=MODE_SCENE,
                 label="Mode"
             )
 
@@ -3589,7 +4467,7 @@ with gr.Blocks(
                 value=(
                     "Hand Engine: Waiting..."
                 ),
-                lines=5,
+                lines=7,
                 interactive=False
             )
 
