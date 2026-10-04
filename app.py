@@ -7,22 +7,7 @@ import json
 from dataclasses import dataclass, field
 from collections import deque, Counter
 
-def _free_space_gpu(*args, **kwargs):
-    if args and callable(args[0]) and len(args) == 1 and not kwargs:
-        return args[0]
-
-    def decorator(function):
-        return function
-
-    return decorator
-
-try:
-    import spaces
-except Exception:
-    spaces = None
-
-USE_GPU = os.getenv("USE_GPU", "0").lower() in {"1", "true", "yes", "on"}
-GPU_DECORATOR = spaces.GPU if (spaces is not None and USE_GPU) else _free_space_gpu
+import spaces
 
 try:
     import torch
@@ -4374,7 +4359,7 @@ class LifeVisionEngine:
 ENGINE = LifeVisionEngine()
 
 
-@GPU_DECORATOR(duration=30)
+@spaces.GPU(duration=30)
 def process_frame(
     frame,
     process_fps,
