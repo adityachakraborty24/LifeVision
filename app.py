@@ -42,7 +42,7 @@ except Exception:
     MEDIAPIPE_AVAILABLE = False
 
 
-APP_VERSION = "25.0"
+APP_VERSION = "25.1"
 
 MODE_FULL = "Full Awareness"
 MODE_OBJECTS = MODE_FULL
@@ -4505,9 +4505,16 @@ def process_frame(
 
     data = ENGINE.format_snapshot(snapshot)
     return (
-        data["metrics"], data["scene"], data["narrative"],
-        data["people"], data["objects"], data["events"],
-        data["hands"], data["diagnostic"],
+        data["metrics"],
+        data["scene"],
+        data["narrative"],
+        data["people"],
+        data["objects"],
+        data["events"],
+        data["hands"],
+        data["faces"],
+        data["body"],
+        data["diagnostic"],
         json.dumps(ENGINE.latest_overlay_payload, separators=(",", ":"))
     )
 
